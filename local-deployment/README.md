@@ -68,6 +68,11 @@ wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd
    ```bash
    ./local-deployment/dns-init.sh
    ```
+   This also installs and enables `beamup-local-dns-init.service` so runtime networking changes are restored automatically after reboot.
+   To disable this behavior:
+   ```bash
+   sudo systemctl disable --now beamup-local-dns-init.service
+   ```
    Optional environment overrides:
    - `LOCAL_BEAMUP_DOMAIN` (default: `beamup.test`)
    - `DNS_UPSTREAM` (default: `1.1.1.1`)

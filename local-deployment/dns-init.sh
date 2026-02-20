@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+INSTALL_BOOT_SERVICE=1
+if [ "${1:-}" = "--no-service-install" ]; then
+  INSTALL_BOOT_SERVICE=0
+  shift
+fi
+
+if [ "$#" -ne 0 ]; then
+  echo "Usage: $0 [--no-service-install]" >&2
+  exit 1
+fi
+
+SCRIPT_PATH="$(readlink -f "$0")"
+BOOT_SERVICE_NAME="beamup-local-dns-init.service"
+BOOT_SERVICE_PATH="/etc/systemd/system/${BOOT_SERVICE_NAME}"
+
 LOCAL_BEAMUP_DOMAIN="${LOCAL_BEAMUP_DOMAIN:-beamup.test}"
 DNS_UPSTREAM="${DNS_UPSTREAM:-1.1.1.1}"
 HOST_LAN_IFACE="${HOST_LAN_IFACE:-$(ip route show default | awk 'NR==1 {print $5}')}"
@@ -79,12 +94,34 @@ ensure_forward_first() {
   sudo iptables -I FORWARD 1 "$@"
 }
 
+install_boot_service() {
+  echo "Installing boot persistence service: ${BOOT_SERVICE_NAME}"
+  sudo tee "${BOOT_SERVICE_PATH}" >/dev/null <<EOF
+[Unit]
+Description=Restore Beamup local DNS/NAT configuration
+Wants=network-online.target
+After=network-online.target libvirtd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash ${SCRIPT_PATH} --no-service-install
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable "${BOOT_SERVICE_NAME}" >/dev/null
+}
+
 if ! ip -4 -o addr show dev "${HOST_LAN_IFACE}" | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${A_RECORD_IP}"; then
   echo "Adding ${A_RECORD_IP}/32 to ${HOST_LAN_IFACE} for a.${LOCAL_BEAMUP_DOMAIN}"
   sudo ip addr add "${A_RECORD_IP}/32" dev "${HOST_LAN_IFACE}"
 fi
 
-echo "Configuring dnsmasq wildcard: *.${LOCAL_BEAMUP_DOMAIN} -> ${HOST_LAN_IP}"
+echo "Configuring dnsmasq: ${LOCAL_BEAMUP_DOMAIN}, www.${LOCAL_BEAMUP_DOMAIN}, a.${LOCAL_BEAMUP_DOMAIN} -> ${A_RECORD_IP}; wildcard -> ${HOST_LAN_IP}"
 sudo tee /etc/dnsmasq.d/beamup-local.conf >/dev/null <<EOF
 listen-address=127.0.0.1,${HOST_LAN_IP}
 bind-interfaces
@@ -93,6 +130,8 @@ server=${DNS_UPSTREAM}
 domain-needed
 bogus-priv
 address=/a.${LOCAL_BEAMUP_DOMAIN}/${A_RECORD_IP}
+address=/${LOCAL_BEAMUP_DOMAIN}/${A_RECORD_IP}
+address=/www.${LOCAL_BEAMUP_DOMAIN}/${A_RECORD_IP}
 address=/.${LOCAL_BEAMUP_DOMAIN}/${HOST_LAN_IP}
 EOF
 sudo systemctl enable dnsmasq
@@ -116,12 +155,26 @@ for port in 80 443; do
   ensure_forward_first -p tcp -d "${TARGET_IP}" --dport "${port}" -j ACCEPT
 done
 
+echo "Adding iptables forwarding for ${LOCAL_BEAMUP_DOMAIN}, www.${LOCAL_BEAMUP_DOMAIN} -> ${DEPLOYER_IP} (80/443)"
+for port in 80 443; do
+  ensure_nat_first PREROUTING -d "${A_RECORD_IP}" -p tcp --dport "${port}" -j DNAT --to-destination "${DEPLOYER_IP}:${port}"
+  ensure_nat_first OUTPUT -d "${A_RECORD_IP}" -p tcp --dport "${port}" -j DNAT --to-destination "${DEPLOYER_IP}:${port}"
+  ensure_forward_first -p tcp -d "${DEPLOYER_IP}" --dport "${port}" -j ACCEPT
+done
+
 echo "Adding iptables forwarding for a.${LOCAL_BEAMUP_DOMAIN}:22 -> ${DEPLOYER_IP}:22"
 ensure_nat_first PREROUTING -d "${A_RECORD_IP}" -p tcp --dport 22 -j DNAT --to-destination "${DEPLOYER_IP}:22"
 ensure_nat_first OUTPUT -d "${A_RECORD_IP}" -p tcp --dport 22 -j DNAT --to-destination "${DEPLOYER_IP}:22"
 ensure_forward_first -p tcp -d "${DEPLOYER_IP}" --dport 22 -j ACCEPT
 
+if [ "${INSTALL_BOOT_SERVICE}" -eq 1 ]; then
+  install_boot_service
+fi
+
 echo "Local access configured."
-echo "a.${LOCAL_BEAMUP_DOMAIN} -> ${A_RECORD_IP} (forwarded to ${DEPLOYER_IP}:22)"
+echo "${LOCAL_BEAMUP_DOMAIN}, www.${LOCAL_BEAMUP_DOMAIN}, a.${LOCAL_BEAMUP_DOMAIN} -> ${A_RECORD_IP}"
+echo "  ${LOCAL_BEAMUP_DOMAIN}, www.${LOCAL_BEAMUP_DOMAIN} forwarded to ${DEPLOYER_IP}:80/443"
+echo "  a.${LOCAL_BEAMUP_DOMAIN} forwarded to ${DEPLOYER_IP}:22"
 echo "Other domains forwarded to upstream DNS ${DNS_UPSTREAM}"
 echo "Use domains like anything.${LOCAL_BEAMUP_DOMAIN} and point your client DNS to ${HOST_LAN_IP}."
+echo "Boot persistence enabled via ${BOOT_SERVICE_NAME}."
