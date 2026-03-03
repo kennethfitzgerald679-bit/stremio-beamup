@@ -60,8 +60,19 @@ apt-get install qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils mkis
 
 
 
-# Adding current user to libvirt
-usermod -a -G libvirt $(whoami)
+# Add the invoking non-root user to libvirt for post-setup virsh/terraform usage.
+# You can override target user by setting TARGET_USER=<username>.
+LIBVIRT_USER="${TARGET_USER:-${SUDO_USER:-}}"
+if [[ -z "${LIBVIRT_USER}" ]]; then
+	LIBVIRT_USER="$(logname 2>/dev/null || true)"
+fi
+
+if [[ -n "${LIBVIRT_USER}" && "${LIBVIRT_USER}" != "root" ]]; then
+	usermod -a -G libvirt "${LIBVIRT_USER}"
+	echo "Added ${LIBVIRT_USER} to libvirt group (re-login required)."
+else
+	echo "Skipping libvirt group assignment: set TARGET_USER=<username> if you need this script to add a non-root user."
+fi
 
 
 
