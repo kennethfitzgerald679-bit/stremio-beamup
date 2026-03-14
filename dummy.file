@@ -1,0 +1,1 @@
+This is a dummy file to test master branch protection that only should allow merge from master or a hotfix/* branch
