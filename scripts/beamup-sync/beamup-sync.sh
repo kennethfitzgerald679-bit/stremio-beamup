@@ -1,1089 +1,920 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
-# Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source common functions and set helper script paths
 if [ -f "${SCRIPT_DIR}/beamup-common.sh" ]; then
+    # shellcheck disable=SC1091
     source "${SCRIPT_DIR}/beamup-common.sh"
     BACKUP_SCRIPT="${SCRIPT_DIR}/beamup-backup.sh"
     RESTORE_SCRIPT="${SCRIPT_DIR}/beamup-restore.sh"
 elif [ -f "/usr/local/lib/beamup/beamup-common" ]; then
+    # shellcheck disable=SC1091
     source "/usr/local/lib/beamup/beamup-common"
     BACKUP_SCRIPT="/usr/local/lib/beamup/beamup-backup"
     RESTORE_SCRIPT="/usr/local/lib/beamup/beamup-restore"
 else
-    echo "Error: Helper scripts not found" >&2
+    echo "beamup-common not found" >&2
     exit 1
 fi
 
-# Parse command and arguments
 COMMAND="${1:-}"
-shift || true
+[ -n "$COMMAND" ] && shift || true
 
 USE_FTP=false
 USE_S3=false
 USE_RSYNC=false
+FORCE=false
 AUTO_RESTORE=false
-FORCE_BACKUP=false
-BACKUP_NAME=""
+PUSH_ALL=false
+USE_LATEST=false
+ARG_VALUE=""
 
-show_usage() {
-    cat << EOF
-Usage: beamup-sync [COMMAND] [OPTIONS]
+declare -a SELECTED_REMOTES=()
 
-Sync backups to/from remote storage.
+usage() {
+    cat <<USAGE
+Usage: beamup-sync <command> [options]
 
-COMMANDS:
-    backup              Create a new local backup only (no remote push)
-    push                Push local backups to remote storage
-    pull BACKUP_NAME    Pull backup from remote storage
-    restore             Restore latest local backup
-    list                List backups on remote storage
-    config              Configure remote storage settings
-    verify              Verify configuration and connectivity
+Commands:
+  config                Create/update /etc/beamup/sync.conf
+  verify                Validate config + dependencies
+  backup                Create local backup archive
+  push                  Push local archive(s) to remote(s)
+  pull <name|--latest>  Pull archive from remote(s)
+  list                  List remote archives
+  restore [archive]     Restore local archive (latest if omitted)
 
-OPTIONS:
-    --ftp               Use FTP storage
-    --s3                Use S3 storage
-    --rsync             Use rsync storage
-    -f, --force         Force creation of new backup before push
-    -r, --restore       Automatically restore after pull
-    -v, --verbose       Enable verbose output
-    -h, --help          Show this help message
+Common options:
+  -v, --verbose         Verbose output
+  -h, --help            Show this help
 
-EXAMPLES:
-    beamup-sync backup                  # Create local backup only
-    beamup-sync backup --verbose        # Create backup with verbose output
-    beamup-sync push                    # Push to all enabled remotes
-    beamup-sync push --force            # Create new backup and push
-    beamup-sync push --ftp --s3         # Push only to FTP and S3
-    beamup-sync push -f --verbose       # Force backup with verbose output
-    beamup-sync pull backup-20231028    # Pull specific backup
-    beamup-sync pull --latest --s3      # Pull latest backup from S3
-    beamup-sync pull --latest -r        # Pull latest and restore
-    beamup-sync restore                 # Restore latest local backup
-    beamup-sync list --ftp              # List backups on FTP
-    beamup-sync config                  # Interactive configuration
-EOF
+Remote selection options (push/pull/list):
+  --ftp --s3 --rsync
+
+Other options:
+  -f, --force           push: run backup first; restore: skip confirm
+  -a, --all             push all local archives (default latest only)
+  -r, --restore         pull then auto-restore
+  --latest              pull latest backup name from remote
+USAGE
 }
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --ftp)
-            USE_FTP=true
-            shift
+require_command() {
+    case "$COMMAND" in
+        config|verify|backup|push|pull|list|restore)
             ;;
-        --s3)
-            USE_S3=true
-            shift
-            ;;
-        --rsync)
-            USE_RSYNC=true
-            shift
-            ;;
-        -f|--force)
-            FORCE_BACKUP=true
-            shift
-            ;;
-        -r|--restore)
-            AUTO_RESTORE=true
-            shift
-            ;;
-        -v|--verbose)
-            VERBOSE=true
-            shift
-            ;;
-        -h|--help)
-            show_usage
+        -h|--help|"")
+            usage
             exit 0
             ;;
-        --latest)
-            BACKUP_NAME="latest"
-            shift
-            ;;
         *)
-            if [ -z "$BACKUP_NAME" ]; then
-                BACKUP_NAME="$1"
-            fi
-            shift
+            usage
+            die "Unknown command: $COMMAND"
             ;;
     esac
-done
-
-# Check root
-check_root
-
-# Initialize logging
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOG_DIR}/sync-${TIMESTAMP}.log"
-init_logging
-
-# Load configuration
-if [ -f "$CONFIG_FILE" ]; then
-    parse_config "$CONFIG_FILE"
-else
-    if [ "$COMMAND" != "config" ]; then
-        log_error "Configuration file not found: $CONFIG_FILE"
-        log_info "Run 'beamup-sync config' to create configuration"
-        exit 1
-    fi
-fi
-
-# Determine which remotes to use
-determine_remotes() {
-    local remotes=()
-    
-    # If flags specified, use only those
-    if [ "$USE_FTP" = true ] || [ "$USE_S3" = true ] || [ "$USE_RSYNC" = true ]; then
-        [ "$USE_FTP" = true ] && remotes+=("ftp")
-        [ "$USE_S3" = true ] && remotes+=("s3")
-        [ "$USE_RSYNC" = true ] && remotes+=("rsync")
-    else
-        # Use enabled remotes from config
-        if [ -n "${general_enabled_remotes:-}" ]; then
-            IFS=',' read -ra remotes <<< "$general_enabled_remotes"
-        fi
-    fi
-    
-    echo "${remotes[@]}"
 }
 
-# FTP functions
-ftp_push() {
-    local backup_file="$1"
-    local backup_name=$(basename "$backup_file")
-    local checksum_file="${backup_file}.sha256"
-    
-    log_info "[FTP] Uploading $backup_name..."
-    
-    if [ "${ftp_enabled:-false}" != "true" ]; then
-        log_warn "[FTP] FTP is not enabled in configuration"
-        return 1
-    fi
-    
-    # Upload using lftp for better reliability
-    if command -v lftp &> /dev/null; then
-        lftp -e "set ftp:ssl-allow no; put -O ${ftp_remote_path} ${backup_file}; put -O ${ftp_remote_path} ${checksum_file}; bye" \
-            -u "${ftp_username},${ftp_password}" "${ftp_host}" >> "$LOG_FILE" 2>&1 && {
-            log_success "[FTP] Upload completed"
-            return 0
-        } || {
-            log_error "[FTP] Upload failed"
-            return 1
-        }
+parse_flags() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ftp)
+                USE_FTP=true
+                shift
+                ;;
+            --s3)
+                USE_S3=true
+                shift
+                ;;
+            --rsync)
+                USE_RSYNC=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -a|--all)
+                PUSH_ALL=true
+                shift
+                ;;
+            -r|--restore)
+                AUTO_RESTORE=true
+                shift
+                ;;
+            --latest)
+                USE_LATEST=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                if [ -z "$ARG_VALUE" ]; then
+                    ARG_VALUE="$1"
+                    shift
+                else
+                    die "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+}
+
+build_selected_remotes() {
+    SELECTED_REMOTES=()
+
+    if [ "$USE_FTP" = true ] || [ "$USE_S3" = true ] || [ "$USE_RSYNC" = true ]; then
+        [ "$USE_FTP" = true ] && SELECTED_REMOTES+=("ftp")
+        [ "$USE_S3" = true ] && SELECTED_REMOTES+=("s3")
+        [ "$USE_RSYNC" = true ] && SELECTED_REMOTES+=("rsync")
     else
-        log_error "[FTP] lftp not installed"
-        return 1
+        local remotes_csv
+        remotes_csv="$(enabled_remotes_csv)"
+        while IFS= read -r r; do
+            [ -n "$r" ] && SELECTED_REMOTES+=("$r")
+        done < <(split_csv "$remotes_csv")
+    fi
+
+    [ ${#SELECTED_REMOTES[@]} -gt 0 ] || die "No remotes selected"
+}
+
+run_backup_script() {
+    [ -x "$BACKUP_SCRIPT" ] || die "Backup script not found: $BACKUP_SCRIPT"
+    if [ "$VERBOSE" = true ]; then
+        BEAMUP_SKIP_LOCK=true "$BACKUP_SCRIPT" --verbose
+    else
+        BEAMUP_SKIP_LOCK=true "$BACKUP_SCRIPT"
+    fi
+}
+
+run_restore_script() {
+    [ -x "$RESTORE_SCRIPT" ] || die "Restore script not found: $RESTORE_SCRIPT"
+
+    local -a cmd=("$RESTORE_SCRIPT")
+    [ "$FORCE" = true ] && cmd+=("--force")
+    [ "$VERBOSE" = true ] && cmd+=("--verbose")
+    [ -n "${1:-}" ] && cmd+=("$1")
+
+    BEAMUP_SKIP_LOCK=true "${cmd[@]}"
+}
+
+ftp_ssl_cfg() {
+    if [ "$(as_bool "$FTP_VERIFY_TLS")" = true ]; then
+        echo "set ftp:ssl-allow yes; set ssl:verify-certificate yes;"
+    else
+        echo "set ftp:ssl-allow yes; set ssl:verify-certificate no;"
+    fi
+}
+
+ftp_push() {
+    local archive="$1"
+    local checksum="$2"
+    [ "$(as_bool "$FTP_ENABLED")" = true ] || return 1
+
+    command -v lftp >/dev/null 2>&1 || die "lftp not installed"
+    local host="${FTP_HOST}:${FTP_PORT}"
+    local ssl
+    ssl="$(ftp_ssl_cfg)"
+
+    if [ "$VERBOSE" = true ]; then
+        lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} mkdir -p ${FTP_REMOTE_PATH}; put -O ${FTP_REMOTE_PATH} ${archive}; put -O ${FTP_REMOTE_PATH} ${checksum}; bye"
+    else
+        lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} mkdir -p ${FTP_REMOTE_PATH}; put -O ${FTP_REMOTE_PATH} ${archive}; put -O ${FTP_REMOTE_PATH} ${checksum}; bye" >> "$LOG_FILE" 2>&1
     fi
 }
 
 ftp_list() {
-    log_info "[FTP] Listing backups..."
-    
-    if command -v lftp &> /dev/null; then
-        lftp -e "set ftp:ssl-allow no; cd ${ftp_remote_path}; cls -1 *.tar.xz; bye" \
-            -u "${ftp_username},${ftp_password}" "${ftp_host}" 2>> "$LOG_FILE"
-    fi
+    [ "$(as_bool "$FTP_ENABLED")" = true ] || return 1
+    command -v lftp >/dev/null 2>&1 || die "lftp not installed"
+
+    local host="${FTP_HOST}:${FTP_PORT}"
+    local ssl
+    ssl="$(ftp_ssl_cfg)"
+
+    lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} cd ${FTP_REMOTE_PATH}; cls -1 *.tar.xz; bye" 2>> "$LOG_FILE" | sort
 }
 
 ftp_pull() {
-    local backup_name="$1"
-    local dest_dir="$2"
+    local wanted="$1"
+    local dest="$2"
 
-    # If backup_name is 'latest', determine the latest backup file
-    if [ "$backup_name" = "latest" ]; then
-        log_info "[FTP] Determining latest backup..."
-        if command -v lftp &> /dev/null; then
-            latest_file=$(lftp -e "set ftp:ssl-allow no; cd ${ftp_remote_path}; cls -1 *.tar.xz; bye" \
-                -u "${ftp_username},${ftp_password}" "${ftp_host}" 2>> "$LOG_FILE" | sort | tail -n 1)
-            if [ -z "$latest_file" ]; then
-                log_error "[FTP] No backups found on remote."
-                return 1
-            fi
-            backup_name="$latest_file"
-            log_info "[FTP] Latest backup is: $backup_name"
-        else
-            log_error "[FTP] lftp not installed"
-            return 1
+    [ "$(as_bool "$FTP_ENABLED")" = true ] || return 1
+    command -v lftp >/dev/null 2>&1 || die "lftp not installed"
+
+    local picked="$wanted"
+    if [ "$picked" = "latest" ]; then
+        picked="$(ftp_list | tail -n 1)"
+        [ -n "$picked" ] || return 1
+    fi
+
+    ensure_dir "$dest"
+
+    local host="${FTP_HOST}:${FTP_PORT}"
+    local ssl
+    ssl="$(ftp_ssl_cfg)"
+
+    if [ "$VERBOSE" = true ]; then
+        lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} get -O ${dest} ${FTP_REMOTE_PATH}/${picked}; get -O ${dest} ${FTP_REMOTE_PATH}/${picked}.sha256; bye"
+    else
+        lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} get -O ${dest} ${FTP_REMOTE_PATH}/${picked}; get -O ${dest} ${FTP_REMOTE_PATH}/${picked}.sha256; bye" >> "$LOG_FILE" 2>&1
+    fi
+
+    echo "$picked"
+}
+
+s3_cmd() {
+    local -a base=(aws --region "$S3_REGION")
+    if [ -n "$S3_ENDPOINT_URL" ]; then
+        base+=(--endpoint-url "$S3_ENDPOINT_URL")
+        if [ "$(as_bool "$S3_VERIFY_SSL")" = false ]; then
+            base+=(--no-verify-ssl)
         fi
     fi
 
-    log_info "[FTP] Downloading $backup_name..."
+    AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" "${base[@]}" s3 "$@"
+}
 
-    if command -v lftp &> /dev/null; then
-        mkdir -p "$dest_dir"
-        lftp -e "set ftp:ssl-allow no; get -O ${dest_dir} ${ftp_remote_path}/${backup_name}; get -O ${dest_dir} ${ftp_remote_path}/${backup_name}.sha256; bye" \
-            -u "${ftp_username},${ftp_password}" "${ftp_host}" >> "$LOG_FILE" 2>&1 && {
-            log_success "[FTP] Download completed"
-            ACTUAL_BACKUP_NAME="$backup_name"
-            return 0
-        } || {
-            log_error "[FTP] Download failed"
-            return 1
-        }
+s3api_cmd() {
+    local -a base=(aws --region "$S3_REGION")
+    if [ -n "$S3_ENDPOINT_URL" ]; then
+        base+=(--endpoint-url "$S3_ENDPOINT_URL")
+        if [ "$(as_bool "$S3_VERIFY_SSL")" = false ]; then
+            base+=(--no-verify-ssl)
+        fi
+    fi
+
+    AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" "${base[@]}" s3api "$@"
+}
+
+s3_bucket_exists() {
+    s3api_cmd head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1
+}
+
+s3_create_bucket() {
+    if [ "$S3_REGION" = "us-east-1" ]; then
+        s3api_cmd create-bucket --bucket "$S3_BUCKET"
+    else
+        s3api_cmd create-bucket --bucket "$S3_BUCKET" \
+            --create-bucket-configuration "LocationConstraint=${S3_REGION}"
     fi
 }
 
-# S3 functions
-s3_push() {
-    local backup_file="$1"
-    local backup_name=$(basename "$backup_file")
-    local checksum_file="${backup_file}.sha256"
-    
-    log_info "[S3] Uploading $backup_name..."
-    
-    if [ "${s3_enabled:-false}" != "true" ]; then
-        log_warn "[S3] S3 is not enabled in configuration"
-        return 1
+s3_ensure_bucket() {
+    [ -n "$S3_BUCKET" ] || die "S3_BUCKET is empty"
+
+    if s3_bucket_exists; then
+        return 0
     fi
-    
-    if command -v aws &> /dev/null; then
-        local aws_cmd="AWS_ACCESS_KEY_ID=\"${s3_access_key}\" AWS_SECRET_ACCESS_KEY=\"${s3_secret_key}\" aws s3 cp"
-        local aws_opts="--region \"${s3_region}\""
-        
-        # Add endpoint-url if configured
-        if [ -n "${s3_endpoint_url:-}" ]; then
-            aws_opts="$aws_opts --endpoint-url \"${s3_endpoint_url}\" --no-verify-ssl"
-        fi
-        
-        eval "$aws_cmd \"$backup_file\" \"s3://${s3_bucket}/${s3_prefix}${backup_name}\" $aws_opts >> \"$LOG_FILE\" 2>&1" && \
-        eval "$aws_cmd \"$checksum_file\" \"s3://${s3_bucket}/${s3_prefix}${backup_name}.sha256\" $aws_opts >> \"$LOG_FILE\" 2>&1" && {
-            log_success "[S3] Upload completed"
-            return 0
-        } || {
-            log_error "[S3] Upload failed"
-            return 1
-        }
+
+    if [ "$(as_bool "$S3_AUTO_CREATE_BUCKET")" != true ]; then
+        die "S3 bucket does not exist: $S3_BUCKET (set S3_AUTO_CREATE_BUCKET=true to auto-create)"
+    fi
+
+    log_warn "S3 bucket does not exist: $S3_BUCKET. Creating it..."
+    if [ "$VERBOSE" = true ]; then
+        s3_create_bucket 2>&1 | tee -a "$LOG_FILE"
     else
-        log_error "[S3] aws-cli not installed"
-        return 1
+        s3_create_bucket >> "$LOG_FILE" 2>&1
     fi
+
+    s3_bucket_exists || die "Failed to create S3 bucket: $S3_BUCKET"
+}
+
+s3_key() {
+    local name="$1"
+    local pfx="$S3_PREFIX"
+    if [ -n "$pfx" ] && [[ "$pfx" != */ ]]; then
+        pfx="${pfx}/"
+    fi
+    echo "${pfx}${name}"
+}
+
+s3_push() {
+    local archive="$1"
+    local checksum="$2"
+    [ "$(as_bool "$S3_ENABLED")" = true ] || return 1
+
+    command -v aws >/dev/null 2>&1 || die "aws CLI not installed"
+    s3_ensure_bucket
+
+    run_cmd s3_cmd cp "$archive" "s3://${S3_BUCKET}/$(s3_key "$(basename "$archive")")"
+    run_cmd s3_cmd cp "$checksum" "s3://${S3_BUCKET}/$(s3_key "$(basename "$checksum")")"
 }
 
 s3_list() {
-    log_info "[S3] Listing backups..."
-    
-    if command -v aws &> /dev/null; then
-        local aws_cmd="AWS_ACCESS_KEY_ID=\"${s3_access_key}\" AWS_SECRET_ACCESS_KEY=\"${s3_secret_key}\" aws s3 ls"
-        local aws_opts="--region \"${s3_region}\""
-        
-        # Add endpoint-url if configured
-        if [ -n "${s3_endpoint_url:-}" ]; then
-            aws_opts="$aws_opts --endpoint-url \"${s3_endpoint_url}\" --no-verify-ssl"
-        fi
-        
-        eval "$aws_cmd \"s3://${s3_bucket}/${s3_prefix}\" $aws_opts 2>> \"$LOG_FILE\" | grep \".tar.xz$\""
-    fi
+    [ "$(as_bool "$S3_ENABLED")" = true ] || return 1
+    command -v aws >/dev/null 2>&1 || die "aws CLI not installed"
+
+    s3_cmd ls "s3://${S3_BUCKET}/$(s3_key "")" 2>> "$LOG_FILE" | awk '$4 ~ /\.tar\.xz$/ {print $4}' | sort
 }
 
 s3_pull() {
-    local backup_name="$1"
-    local dest_dir="$2"
-    
-    log_info "[S3] Downloading $backup_name..."
-    
-    if command -v aws &> /dev/null; then
-        mkdir -p "$dest_dir"
-        
-        local aws_cmd="AWS_ACCESS_KEY_ID=\"${s3_access_key}\" AWS_SECRET_ACCESS_KEY=\"${s3_secret_key}\" aws s3 cp"
-        local aws_opts="--region \"${s3_region}\""
-        
-        # Add endpoint-url if configured
-        if [ -n "${s3_endpoint_url:-}" ]; then
-            aws_opts="$aws_opts --endpoint-url \"${s3_endpoint_url}\" --no-verify-ssl"
-        fi
-        
-        eval "$aws_cmd \"s3://${s3_bucket}/${s3_prefix}${backup_name}\" \"${dest_dir}/${backup_name}\" $aws_opts >> \"$LOG_FILE\" 2>&1" && \
-        eval "$aws_cmd \"s3://${s3_bucket}/${s3_prefix}${backup_name}.sha256\" \"${dest_dir}/${backup_name}.sha256\" $aws_opts >> \"$LOG_FILE\" 2>&1" && {
-            log_success "[S3] Download completed"
-            return 0
-        } || {
-            log_error "[S3] Download failed"
-            return 1
-        }
+    local wanted="$1"
+    local dest="$2"
+
+    [ "$(as_bool "$S3_ENABLED")" = true ] || return 1
+    command -v aws >/dev/null 2>&1 || die "aws CLI not installed"
+
+    local picked="$wanted"
+    if [ "$picked" = "latest" ]; then
+        picked="$(s3_list | tail -n 1)"
+        [ -n "$picked" ] || return 1
+    fi
+
+    ensure_dir "$dest"
+
+    run_cmd s3_cmd cp "s3://${S3_BUCKET}/$(s3_key "$picked")" "${dest}/${picked}"
+    run_cmd s3_cmd cp "s3://${S3_BUCKET}/$(s3_key "${picked}.sha256")" "${dest}/${picked}.sha256"
+
+    echo "$picked"
+}
+
+quote_shell() {
+    printf "%s" "$1" | sed "s/'/'\\''/g; 1s/^/'/; \$s/\$/'/"
+}
+
+rsync_mode() {
+    local mode
+    mode="$(echo "${RSYNC_MODE:-ssh}" | tr '[:upper:]' '[:lower:]')"
+    case "$mode" in
+        ssh|daemon) echo "$mode" ;;
+        *) die "Invalid RSYNC_MODE: $RSYNC_MODE (expected ssh or daemon)" ;;
+    esac
+}
+
+rsync_effective_port() {
+    local mode
+    mode="$(rsync_mode)"
+    if [ -n "${RSYNC_PORT:-}" ]; then
+        echo "$RSYNC_PORT"
+    elif [ "$mode" = "daemon" ]; then
+        echo "873"
+    else
+        echo "22"
     fi
 }
 
-# Rsync functions
-rsync_push() {
-    local backup_file="$1"
-    local backup_name=$(basename "$backup_file")
-    local checksum_file="${backup_file}.sha256"
-    
-    log_info "[RSYNC] Uploading $backup_name..."
-    
-    if [ "${rsync_enabled:-false}" != "true" ]; then
-        log_warn "[RSYNC] Rsync is not enabled in configuration"
-        return 1
-    fi
-    
-    local rsync_opts="-avz"
-    [ "$VERBOSE" = true ] && rsync_opts="-avzP"
-    
-    if [ -n "${rsync_ssh_key:-}" ]; then
-        rsync $rsync_opts -e "ssh -i ${rsync_ssh_key}" \
-            "$backup_file" "$checksum_file" \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/" >> "$LOG_FILE" 2>&1 && {
-            log_success "[RSYNC] Upload completed"
-            return 0
-        } || {
-            log_error "[RSYNC] Upload failed"
-            return 1
-        }
+rsync_daemon_base() {
+    local path="${RSYNC_REMOTE_PATH#/}"
+    [ -n "$path" ] || die "RSYNC_REMOTE_PATH must be set for daemon mode (module[/path])"
+
+    local port
+    port="$(rsync_effective_port)"
+    local user_part=""
+    [ -n "${RSYNC_USER:-}" ] && user_part="${RSYNC_USER}@"
+
+    echo "rsync://${user_part}${RSYNC_HOST}:${port}/${path}"
+}
+
+rsync_daemon_push() {
+    local archive="$1"
+    local checksum="$2"
+    local opts="$3"
+    local base
+    base="$(rsync_daemon_base)"
+
+    if [ -n "$RSYNC_PASSWORD" ]; then
+        RSYNC_PASSWORD="$RSYNC_PASSWORD" rsync $opts "$archive" "$checksum" "${base}/" >> "$LOG_FILE" 2>&1
     else
-        rsync $rsync_opts "$backup_file" "$checksum_file" \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/" >> "$LOG_FILE" 2>&1 && {
-            log_success "[RSYNC] Upload completed"
+        rsync $opts "$archive" "$checksum" "${base}/" >> "$LOG_FILE" 2>&1
+    fi
+}
+
+rsync_daemon_list() {
+    local base
+    base="$(rsync_daemon_base)"
+    local output=""
+
+    if [ -n "$RSYNC_PASSWORD" ]; then
+        output="$(RSYNC_PASSWORD="$RSYNC_PASSWORD" rsync --list-only "${base}/" 2>> "$LOG_FILE")" || return 1
+    else
+        output="$(rsync --list-only "${base}/" 2>> "$LOG_FILE")" || return 1
+    fi
+
+    echo "$output" | awk '$NF ~ /\.tar\.xz$/ {name=$NF; sub(/\/$/, "", name); print name}' | sort
+}
+
+rsync_daemon_pull() {
+    local wanted="$1"
+    local dest="$2"
+    local opts="$3"
+    local picked="$wanted"
+
+    if [ "$picked" = "latest" ]; then
+        picked="$(rsync_daemon_list | tail -n 1)"
+        [ -n "$picked" ] || return 1
+    fi
+
+    ensure_dir "$dest"
+
+    local base
+    base="$(rsync_daemon_base)"
+    if [ -n "$RSYNC_PASSWORD" ]; then
+        RSYNC_PASSWORD="$RSYNC_PASSWORD" rsync $opts \
+            "${base}/${picked}" \
+            "${base}/${picked}.sha256" \
+            "$dest/" >> "$LOG_FILE" 2>&1
+    else
+        rsync $opts \
+            "${base}/${picked}" \
+            "${base}/${picked}.sha256" \
+            "$dest/" >> "$LOG_FILE" 2>&1
+    fi
+
+    echo "$picked"
+}
+
+rsync_ssh() {
+    local remote_cmd="$1"
+    local -a ssh_port_opts=()
+    local port
+    port="$(rsync_effective_port)"
+    [ -n "$port" ] && ssh_port_opts=(-p "$port")
+
+    if [ -n "$RSYNC_SSH_KEY" ] && [ -f "$RSYNC_SSH_KEY" ]; then
+        if ssh -o BatchMode=yes "${ssh_port_opts[@]}" -i "$RSYNC_SSH_KEY" "${RSYNC_USER}@${RSYNC_HOST}" "$remote_cmd" 2>> "$LOG_FILE"; then
             return 0
-        } || {
-            log_error "[RSYNC] Upload failed"
-            return 1
-        }
+        fi
+        [ -n "$RSYNC_PASSWORD" ] || return 1
+    fi
+
+    if [ -n "$RSYNC_PASSWORD" ]; then
+        command -v sshpass >/dev/null 2>&1 || die "sshpass not installed for rsync password fallback"
+        SSHPASS="$RSYNC_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${ssh_port_opts[@]}" "${RSYNC_USER}@${RSYNC_HOST}" "$remote_cmd" 2>> "$LOG_FILE"
+        return $?
+    fi
+
+    ssh -o BatchMode=yes "${ssh_port_opts[@]}" "${RSYNC_USER}@${RSYNC_HOST}" "$remote_cmd" 2>> "$LOG_FILE"
+}
+
+rsync_transfer_ssh() {
+    local opts="$1"
+    shift
+    local port
+    port="$(rsync_effective_port)"
+    local ssh_cmd="ssh -o BatchMode=yes -p ${port}"
+
+    if [ -n "$RSYNC_SSH_KEY" ] && [ -f "$RSYNC_SSH_KEY" ]; then
+        if rsync $opts -e "${ssh_cmd} -i ${RSYNC_SSH_KEY}" "$@" >> "$LOG_FILE" 2>&1; then
+            return 0
+        fi
+        [ -n "$RSYNC_PASSWORD" ] || return 1
+    fi
+
+    if [ -n "$RSYNC_PASSWORD" ]; then
+        command -v sshpass >/dev/null 2>&1 || die "sshpass not installed for rsync password fallback"
+        SSHPASS="$RSYNC_PASSWORD" sshpass -e rsync $opts -e "ssh -p ${port} -o PreferredAuthentications=password -o PubkeyAuthentication=no" "$@" >> "$LOG_FILE" 2>&1
+        return $?
+    fi
+
+    rsync $opts -e "$ssh_cmd" "$@" >> "$LOG_FILE" 2>&1
+}
+
+rsync_push() {
+    local archive="$1"
+    local checksum="$2"
+    [ "$(as_bool "$RSYNC_ENABLED")" = true ] || return 1
+
+    command -v rsync >/dev/null 2>&1 || die "rsync not installed"
+
+    local opts="-az"
+    [ "$VERBOSE" = true ] && opts="-avzP"
+
+    if [ "$(rsync_mode)" = "daemon" ]; then
+        rsync_daemon_push "$archive" "$checksum" "$opts"
+    else
+        rsync_transfer_ssh "$opts" "$archive" "$checksum" "${RSYNC_USER}@${RSYNC_HOST}:${RSYNC_REMOTE_PATH}/"
     fi
 }
 
 rsync_list() {
-    log_info "[RSYNC] Listing backups..."
-    
-    if [ -n "${rsync_ssh_key:-}" ]; then
-        ssh -i "${rsync_ssh_key}" "${rsync_user}@${rsync_host}" \
-            "ls -lh ${rsync_remote_path}/*.tar.xz" 2>> "$LOG_FILE"
+    [ "$(as_bool "$RSYNC_ENABLED")" = true ] || return 1
+    command -v rsync >/dev/null 2>&1 || die "rsync not installed"
+
+    if [ "$(rsync_mode)" = "daemon" ]; then
+        rsync_daemon_list
     else
-        ssh "${rsync_user}@${rsync_host}" \
-            "ls -lh ${rsync_remote_path}/*.tar.xz" 2>> "$LOG_FILE"
+        local quoted
+        quoted="$(quote_shell "$RSYNC_REMOTE_PATH")"
+        rsync_ssh "find ${quoted} -maxdepth 1 -type f -name '*.tar.xz' -exec basename {} \\;" | sort
     fi
 }
 
 rsync_pull() {
-    local backup_name="$1"
-    local dest_dir="$2"
-    
-    log_info "[RSYNC] Downloading $backup_name..."
-    
-    mkdir -p "$dest_dir"
-    
-    local rsync_opts="-avz"
-    [ "$VERBOSE" = true ] && rsync_opts="-avzP"
-    
-    if [ -n "${rsync_ssh_key:-}" ]; then
-        rsync $rsync_opts -e "ssh -i ${rsync_ssh_key}" \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/${backup_name}" \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/${backup_name}.sha256" \
-            "$dest_dir/" >> "$LOG_FILE" 2>&1 && {
-            log_success "[RSYNC] Download completed"
-            return 0
-        } || {
-            log_error "[RSYNC] Download failed"
-            return 1
-        }
-    else
-        rsync $rsync_opts \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/${backup_name}" \
-            "${rsync_user}@${rsync_host}:${rsync_remote_path}/${backup_name}.sha256" \
-            "$dest_dir/" >> "$LOG_FILE" 2>&1 && {
-            log_success "[RSYNC] Download completed"
-            return 0
-        } || {
-            log_error "[RSYNC] Download failed"
-            return 1
-        }
+    local wanted="$1"
+    local dest="$2"
+
+    [ "$(as_bool "$RSYNC_ENABLED")" = true ] || return 1
+    command -v rsync >/dev/null 2>&1 || die "rsync not installed"
+
+    local picked="$wanted"
+    if [ "$picked" = "latest" ]; then
+        picked="$(rsync_list | tail -n 1)"
+        [ -n "$picked" ] || return 1
     fi
+
+    ensure_dir "$dest"
+
+    local opts="-az"
+    [ "$VERBOSE" = true ] && opts="-avzP"
+
+    if [ "$(rsync_mode)" = "daemon" ]; then
+        rsync_daemon_pull "$picked" "$dest" "$opts" >/dev/null
+    else
+        rsync_transfer_ssh "$opts" \
+            "${RSYNC_USER}@${RSYNC_HOST}:${RSYNC_REMOTE_PATH}/${picked}" \
+            "${RSYNC_USER}@${RSYNC_HOST}:${RSYNC_REMOTE_PATH}/${picked}.sha256" \
+            "$dest/"
+    fi
+
+    echo "$picked"
 }
 
-# Command: backup
-cmd_backup() {
-    log_info "Starting local backup operation (no remote push)"
-    
-    acquire_lock
-    trap release_lock EXIT
-    
-    # Check if backup script exists
-    if [ ! -f "$BACKUP_SCRIPT" ]; then
-        log_error "beamup-backup.sh not found at $BACKUP_SCRIPT"
-        exit 1
-    fi
-    
-    log_info "Running beamup-backup.sh..."
-    if [ "$VERBOSE" = true ]; then
-        "$BACKUP_SCRIPT" --verbose
-    else
-        "$BACKUP_SCRIPT"
-    fi
-    
-    # Verify backup was created
-    local latest_backup=$(get_latest_backup)
-    if [ -z "$latest_backup" ]; then
-        log_error "Backup creation failed"
-        exit 1
-    fi
-    
-    log_success "Local backup created successfully"
-    log_info "Backup location: $latest_backup"
-    log_info "To push this backup to remote storage, run: beamup-sync push"
-}
-
-# Command: push
-cmd_push() {
-    log_info "Starting backup push operation"
-    
-    acquire_lock
-    trap release_lock EXIT
-    
-    # Determine remotes to use
-    local remotes=($(determine_remotes))
-    
-    # If no remotes configured, just run backup
-    if [ ${#remotes[@]} -eq 0 ]; then
-        log_warn "No remotes configured, running backup only..."
-        
-        # Check if backup script exists
-        if [ -f "$BACKUP_SCRIPT" ]; then
-            log_info "Running beamup-backup.sh..."
-            if [ "$VERBOSE" = true ]; then
-                "$BACKUP_SCRIPT" --verbose
-            else
-                "$BACKUP_SCRIPT"
-            fi
-            log_success "Backup completed (no remotes to push to)"
-            exit 0
-        else
-            log_error "beamup-backup.sh not found at $BACKUP_SCRIPT"
-            exit 1
-        fi
-    fi
-    
-    # Find backups to push
-    local backups=""
-    
-    # If --force flag is set, create a new backup first
-    if [ "$FORCE_BACKUP" = true ]; then
-        log_info "Force flag detected, creating new backup..."
-        
-        if [ -f "$BACKUP_SCRIPT" ]; then
-            log_info "Running beamup-backup.sh..."
-            if [ "$VERBOSE" = true ]; then
-                "$BACKUP_SCRIPT" --verbose
-            else
-                "$BACKUP_SCRIPT"
-            fi
-            
-            # Get the newly created backup (should be the latest)
-            backups=$(get_latest_backup)
-            if [ -z "$backups" ]; then
-                log_error "Backup creation failed"
-                exit 1
-            fi
-            log_success "New backup created successfully"
-        else
-            log_error "beamup-backup.sh not found at $BACKUP_SCRIPT"
-            exit 1
-        fi
-    else
-        # Normal operation: find existing backups to push
-        backups=$(list_local_backups)
-        if [ -z "$backups" ]; then
-            log_warn "No backups found to push"
-            
-            # Offer to create backup
-            log_info "Would you like to create a backup now? This will happen automatically."
-            if [ -f "$BACKUP_SCRIPT" ]; then
-                log_info "Running beamup-backup.sh..."
-                if [ "$VERBOSE" = true ]; then
-                    "$BACKUP_SCRIPT" --verbose
-                else
-                    "$BACKUP_SCRIPT"
-                fi
-                
-                # Get the newly created backup
-                backups=$(list_local_backups)
-                if [ -z "$backups" ]; then
-                    log_error "Backup creation failed"
-                    exit 1
-                fi
-            else
-                log_error "beamup-backup.sh not found"
-                exit 1
-            fi
-        fi
-    fi
-    
-    log_info "Pushing to remotes: ${remotes[*]}"
-    
-    local success_count=0
-    local fail_count=0
-    
-    while IFS= read -r backup_file; do
-        log_info "Processing: $(basename "$backup_file")"
-        
-        local remote_success=0
-        local remote_fail=0
-        
-        for remote in "${remotes[@]}"; do
-            case "$remote" in
-                ftp)
-                    ftp_push "$backup_file" && ((remote_success++)) || ((remote_fail++))
-                    ;;
-                s3)
-                    s3_push "$backup_file" && ((remote_success++)) || ((remote_fail++))
-                    ;;
-                rsync)
-                    rsync_push "$backup_file" && ((remote_success++)) || ((remote_fail++))
-                    ;;
-            esac
-        done
-        
-        if [ $remote_success -gt 0 ]; then
-            ((success_count++))
-            if [ $remote_fail -gt 0 ]; then
-                log_warn "Backup pushed to $remote_success remote(s), but failed on $remote_fail"
-            fi
-        else
-            ((fail_count++))
-            log_error "Failed to push backup to any remote"
-        fi
-    done <<< "$backups"
-    
-    log_info "=========================================="
-    log_success "Push operation completed"
-    log_info "Successful: $success_count, Failed: $fail_count"
-    log_info "=========================================="
-    
-    [ $success_count -gt 0 ] && exit 0 || exit 1
-}
-
-# Command: pull
-cmd_pull() {
-    if [ -z "$BACKUP_NAME" ]; then
-        log_error "Backup name required. Use: beamup-sync pull BACKUP_NAME"
-        exit 1
-    fi
-    
-    log_info "Starting backup pull operation"
-    
-    acquire_lock
-    trap release_lock EXIT
-    
-    local remotes=($(determine_remotes))
-    if [ ${#remotes[@]} -eq 0 ]; then
-        log_error "No remotes configured or specified"
-        exit 1
-    fi
-    
-    # Create download directory
-    local download_ts=$(date +%Y%m%d_%H%M%S)
-    local download_dir="${BEAMUP_BASE}/downloaded-${download_ts}"
-    mkdir -p "$download_dir"
-    
-    log_info "Pulling from remotes: ${remotes[*]}"
-    
-    local downloaded=false
-    ACTUAL_BACKUP_NAME=""
-    for remote in "${remotes[@]}"; do
-        case "$remote" in
-            ftp)
-                ftp_pull "$BACKUP_NAME" "$download_dir" && downloaded=true && break
-                ;;
-            s3)
-                s3_pull "$BACKUP_NAME" "$download_dir" && downloaded=true && break
-                ;;
-            rsync)
-                rsync_pull "$BACKUP_NAME" "$download_dir" && downloaded=true && break
-                ;;
-        esac
-    done
-    if [ -n "$ACTUAL_BACKUP_NAME" ]; then
-        BACKUP_NAME="$ACTUAL_BACKUP_NAME"
-    fi
-
-    if [ "$downloaded" = false ]; then
-        log_error "Failed to download backup from any remote"
-        rm -rf "$download_dir"
-        exit 1
-    fi
-    
-    local downloaded_file="${download_dir}/${BACKUP_NAME}"
-    
-    # Verify downloaded backup
-    verify_backup "$downloaded_file" || {
-        log_error "Downloaded backup failed integrity check"
-        exit 1
-    }
-    
-    log_success "Backup downloaded successfully to: $downloaded_file"
-    
-    # Auto-restore if requested
-    if [ "$AUTO_RESTORE" = true ]; then
-        log_info "Auto-restore enabled, starting restore..."
-        "$RESTORE_SCRIPT" --force "$downloaded_file"
-    fi
-}
-
-# Command: restore
-cmd_restore() {
-    log_info "Starting restore from latest local backup"
-    "$RESTORE_SCRIPT"
-}
-
-# Command: list
-cmd_list() {
-    local remotes=($(determine_remotes))
-    if [ ${#remotes[@]} -eq 0 ]; then
-        log_error "No remotes configured or specified"
-        exit 1
-    fi
-    
-    for remote in "${remotes[@]}"; do
-        echo ""
-        echo "=== $remote backups ==="
-        case "$remote" in
-            ftp) ftp_list ;;
-            s3) s3_list ;;
-            rsync) rsync_list ;;
-        esac
-    done
-}
-
-# Command: config
-cmd_config() {
-    echo ""
-    echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║          Beamup Sync - Interactive Configuration              ║${NC}"
-    echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    
-    mkdir -p "$CONFIG_DIR"
-    
-    # Check if updating existing config or creating new
-    local updating_config=false
-    if [ -f "$CONFIG_FILE" ]; then
-        updating_config=true
-    fi
-    
-    # Backup existing config if it exists
-    if [ -f "$CONFIG_FILE" ]; then
-        local backup_config="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$CONFIG_FILE" "$backup_config"
-        log_info "Existing configuration backed up to: $backup_config"
-        echo ""
-    fi
-    
-    # Start building config
-    local config_content="# Beamup Sync Configuration
-# Generated on $(date +%Y-%m-%d\ %H:%M:%S)
-
-[general]
-"
-    
-    # General settings
-    echo -e "${GREEN}=== General Settings ===${NC}"
-    echo ""
-    
-    read -p "Retention days for backups [30]: " retention_days
-    retention_days=${retention_days:-30}
-    config_content+="retention_days=${retention_days}
-"
-    
-    read -p "Enable parallel uploads? (y/n) [n]: " parallel_uploads
-    parallel_uploads=${parallel_uploads:-n}
-    if [[ "$parallel_uploads" =~ ^[yY]$ ]]; then
-        config_content+="parallel_uploads=true
-"
-    else
-        config_content+="parallel_uploads=false
-"
-    fi
-    
-    read -p "Require all remotes to succeed? (y/n) [n]: " require_all
-    require_all=${require_all:-n}
-    if [[ "$require_all" =~ ^[yY]$ ]]; then
-        config_content+="require_all_success=true
-"
-    else
-        config_content+="require_all_success=false
-"
-    fi
-    
-    local enabled_remotes=()
-    
-    # FTP Configuration
-    echo ""
-    echo -e "${GREEN}=== FTP Configuration ===${NC}"
-    echo ""
-    read -p "Enable FTP backup? (y/n) [n]: " enable_ftp
-    enable_ftp=${enable_ftp:-n}
-    
-    if [[ "$enable_ftp" =~ ^[yY]$ ]]; then
-        enabled_remotes+=("ftp")
-        config_content+="
-[ftp]
-enabled=true
-"
-        
-        read -p "FTP Host: " ftp_host
-        config_content+="host=${ftp_host}
-"
-        
-        read -p "FTP Port [21]: " ftp_port
-        ftp_port=${ftp_port:-21}
-        config_content+="port=${ftp_port}
-"
-        
-        read -p "FTP Username: " ftp_user
-        config_content+="username=${ftp_user}
-"
-        
-        read -sp "FTP Password: " ftp_pass
-        echo ""
-        config_content+="password=${ftp_pass}
-"
-        
-        read -p "Remote path [/backups]: " ftp_path
-        ftp_path=${ftp_path:-/backups}
-        config_content+="remote_path=${ftp_path}
-"
-        
-        read -p "Verify SSL? (y/n) [y]: " ftp_ssl
-        ftp_ssl=${ftp_ssl:-y}
-        if [[ "$ftp_ssl" =~ ^[yY]$ ]]; then
-            config_content+="verify_ssl=true
-"
-        else
-            config_content+="verify_ssl=false
-"
-        fi
-    else
-        config_content+="
-[ftp]
-enabled=false
-host=ftp.example.com
-port=21
-username=backup_user
-password=
-remote_path=/backups
-verify_ssl=true
-"
-    fi
-    
-    # S3 Configuration
-    echo ""
-    echo -e "${GREEN}=== S3 Configuration ===${NC}"
-    echo ""
-    read -p "Enable S3 backup? (y/n) [n]: " enable_s3
-    enable_s3=${enable_s3:-n}
-    
-    if [[ "$enable_s3" =~ ^[yY]$ ]]; then
-        enabled_remotes+=("s3")
-        config_content+="
-[s3]
-enabled=true
-"
-        
-        read -p "S3 Bucket name: " s3_bucket
-        config_content+="bucket=${s3_bucket}
-"
-        
-        read -p "S3 Region [us-east-1]: " s3_region
-        s3_region=${s3_region:-us-east-1}
-        config_content+="region=${s3_region}
-"
-        
-        read -p "S3 Access Key: " s3_access
-        config_content+="access_key=${s3_access}
-"
-        
-        read -sp "S3 Secret Key: " s3_secret
-        echo ""
-        config_content+="secret_key=${s3_secret}
-"
-        
-        read -p "S3 Prefix (path) []: " s3_prefix
-        config_content+="prefix=${s3_prefix}
-"
-        
-        # New: Endpoint URL for testing/mockup servers
-        echo ""
-        echo -e "${YELLOW}Testing/Development Options:${NC}"
-        read -p "S3 Endpoint URL (for testing with MinIO/LocalStack, leave empty for AWS) []: " s3_endpoint
-        if [ -n "$s3_endpoint" ]; then
-            config_content+="endpoint_url=${s3_endpoint}
-"
-            log_info "Custom endpoint configured - SSL verification will be disabled"
-        else
-            config_content+="endpoint_url=
-"
-        fi
-    else
-        config_content+="
-[s3]
-enabled=false
-bucket=my-backups
-region=us-east-1
-access_key=
-secret_key=
-prefix=
-endpoint_url=
-"
-    fi
-    
-    # Rsync Configuration
-    echo ""
-    echo -e "${GREEN}=== Rsync Configuration ===${NC}"
-    echo ""
-    read -p "Enable Rsync backup? (y/n) [n]: " enable_rsync
-    enable_rsync=${enable_rsync:-n}
-    
-    if [[ "$enable_rsync" =~ ^[yY]$ ]]; then
-        enabled_remotes+=("rsync")
-        config_content+="
-[rsync]
-enabled=true
-"
-        
-        read -p "Rsync Host: " rsync_host
-        config_content+="host=${rsync_host}
-"
-        
-        read -p "Rsync User: " rsync_user
-        config_content+="user=${rsync_user}
-"
-        
-        read -p "Remote path: " rsync_path
-        config_content+="remote_path=${rsync_path}
-"
-        
-        read -p "SSH Key path [/root/.ssh/id_rsa]: " rsync_key
-        rsync_key=${rsync_key:-/root/.ssh/id_rsa}
-        config_content+="ssh_key=${rsync_key}
-"
-    else
-        config_content+="
-[rsync]
-enabled=false
-host=backup.example.com
-user=backup
-remote_path=/backups
-ssh_key=/root/.ssh/id_rsa
-"
-    fi
-    
-    # Add enabled_remotes to general section
-    if [ ${#enabled_remotes[@]} -gt 0 ]; then
-        local remotes_str=$(IFS=,; echo "${enabled_remotes[*]}")
-        # Insert after [general] section
-        config_content=$(echo "$config_content" | sed "s/\[general\]/[general]\nenabled_remotes=${remotes_str}/")
-    else
-        config_content=$(echo "$config_content" | sed "s/\[general\]/[general]\nenabled_remotes=/")
-    fi
-    
-    # Write configuration file
-    echo "$config_content" > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
-    
-    echo ""
-    echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║              Configuration saved successfully!                 ║${NC}"
-    echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    log_success "Configuration file created: $CONFIG_FILE"
-    log_info "File permissions set to 600 (readable only by owner)"
-    
-    if [ ${#enabled_remotes[@]} -gt 0 ]; then
-        log_info "Enabled remotes: ${enabled_remotes[*]}"
-        echo ""
-        log_info "Testing configuration..."
-        cmd_verify
-    else
-        log_warn "No remotes enabled. You can edit $CONFIG_FILE to enable remotes later."
-    fi
-    
-    # Cronjob configuration
-    echo ""
-    echo -e "${GREEN}=== Automatic Backup Schedule ===${NC}"
-    echo ""
-    read -p "Would you like to set up automatic backups? (y/n) [y]: " setup_cron
-    setup_cron=${setup_cron:-y}
-    
-    if [[ "$setup_cron" =~ ^[yY]$ ]]; then
-        configure_cronjob "$updating_config"
-    else
-        log_info "Skipping automatic backup setup"
-        echo ""
-        log_info "You can manually set up a cronjob later with:"
-        log_info "  crontab -e"
-        log_info "  # Add: 0 2 * * * /usr/local/bin/beamup-sync push >/dev/null 2>&1"
-    fi
-}
-
-# Configure cronjob for automatic backups
-configure_cronjob() {
-    local updating="$1"
-    
-    echo ""
-    echo "Select backup frequency:"
-    echo "  1) Daily (recommended)"
-    echo "  2) Weekly (every Sunday)"
-    echo "  3) Custom schedule"
-    echo ""
-    read -p "Choose option [1]: " cron_option
-    cron_option=${cron_option:-1}
-    
-    local cron_schedule=""
-    local cron_description=""
-    
-    case $cron_option in
-        1)
-            read -p "What time (24-hour format, e.g., 02:00)? [02:00]: " backup_time
-            backup_time=${backup_time:-02:00}
-            
-            # Parse hour and minute
-            local hour=$(echo "$backup_time" | cut -d: -f1)
-            local minute=$(echo "$backup_time" | cut -d: -f2)
-            
-            # Remove leading zeros for cron
-            hour=$((10#$hour))
-            minute=$((10#$minute))
-            
-            cron_schedule="$minute $hour * * *"
-            cron_description="Daily at $backup_time"
-            ;;
-        2)
-            read -p "What time on Sunday (24-hour format, e.g., 02:00)? [02:00]: " backup_time
-            backup_time=${backup_time:-02:00}
-            
-            local hour=$(echo "$backup_time" | cut -d: -f1)
-            local minute=$(echo "$backup_time" | cut -d: -f2)
-            
-            hour=$((10#$hour))
-            minute=$((10#$minute))
-            
-            cron_schedule="$minute $hour * * 0"
-            cron_description="Weekly on Sunday at $backup_time"
-            ;;
-        3)
-            echo ""
-            echo "Enter cron schedule (e.g., '0 2 * * *' for daily at 2 AM):"
-            read -p "Schedule: " custom_schedule
-            cron_schedule="$custom_schedule"
-            cron_description="Custom: $custom_schedule"
-            ;;
-        *)
-            log_error "Invalid option"
-            return 1
-            ;;
+remote_push() {
+    case "$1" in
+        ftp) ftp_push "$2" "$3" ;;
+        s3) s3_push "$2" "$3" ;;
+        rsync) rsync_push "$2" "$3" ;;
+        *) return 1 ;;
     esac
-    
-    # Verbose option
-    read -p "Enable verbose logging in cronjob? (y/n) [n]: " cron_verbose
-    cron_verbose=${cron_verbose:-n}
-    
-    local beamup_command="/usr/local/bin/beamup-sync push"
-    if [[ "$cron_verbose" =~ ^[yY]$ ]]; then
-        beamup_command="$beamup_command --verbose"
-    fi
-    
-    # Build the cron entry
-    local cron_entry="# Beamup automatic backup - $cron_description"
-    cron_entry="$cron_entry
-$cron_schedule $beamup_command"
-    
-    cron_entry="$cron_entry >/dev/null 2>&1"
-    
-    # Check for existing beamup cronjob
-    if crontab -l 2>/dev/null | grep -q "beamup-sync push"; then
-        echo ""
-        log_warn "Existing beamup cronjob found"
-        
-        if [ "$updating" = true ]; then
-            read -p "Replace existing cronjob? (y/n) [y]: " replace_cron
-            replace_cron=${replace_cron:-y}
-        else
-            replace_cron="y"
-        fi
-        
-        if [[ "$replace_cron" =~ ^[yY]$ ]]; then
-            # Remove old beamup entries
-            crontab -l 2>/dev/null | grep -v "beamup-sync push" | grep -v "Beamup automatic backup" | crontab -
-            log_info "Removed old beamup cronjob"
-        else
-            log_info "Keeping existing cronjob"
-            return 0
-        fi
-    fi
-    
-    # Add new cronjob
-    (crontab -l 2>/dev/null; echo ""; echo "$cron_entry") | crontab -
-    
-    echo ""
-    log_success "Cronjob installed successfully!"
-    echo ""
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║                    Backup Schedule                             ║${NC}"
-    echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${GREEN}║  Schedule: $cron_description"
-    echo -e "${GREEN}║  Command: $beamup_command"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    log_info "View your crontab with: crontab -l"
-    log_info "Edit your crontab with: crontab -e"
 }
 
-# Command: verify
-cmd_verify() {
-    log_info "Verifying configuration..."
-    
-    if [ ! -f "$CONFIG_FILE" ]; then
-        log_error "Configuration file not found"
-        exit 1
+remote_list() {
+    case "$1" in
+        ftp) ftp_list ;;
+        s3) s3_list ;;
+        rsync) rsync_list ;;
+        *) return 1 ;;
+    esac
+}
+
+remote_pull() {
+    case "$1" in
+        ftp) ftp_pull "$2" "$3" ;;
+        s3) s3_pull "$2" "$3" ;;
+        rsync) rsync_pull "$2" "$3" ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_config() {
+    require_root
+    load_config
+    init_log "config"
+
+    prompt() {
+        local text="$1"
+        local default="$2"
+        local answer=""
+        if [ -n "$default" ]; then
+            read -r -p "$text [$default]: " answer
+            echo "${answer:-$default}"
+        else
+            read -r -p "$text: " answer
+            echo "$answer"
+        fi
+    }
+
+    prompt_bool() {
+        local text="$1"
+        local default="$2"
+        local answer=""
+        read -r -p "$text [$default]: " answer
+        answer="${answer:-$default}"
+        if [[ "$answer" =~ ^([yY]|yes|YES|true|TRUE|1)$ ]]; then
+            echo "true"
+        else
+            echo "false"
+        fi
+    }
+
+    prompt_secret() {
+        local text="$1"
+        local answer=""
+        read -r -s -p "$text: " answer
+        echo ""
+        echo "$answer"
+    }
+
+    BEAMUP_BASE="$(prompt "Beamup base directory" "$BEAMUP_BASE")"
+    LOCAL_ARCHIVE_DIR="$(prompt "Archive directory" "$LOCAL_ARCHIVE_DIR")"
+    DOWNLOAD_DIR="$(prompt "Download directory" "$DOWNLOAD_DIR")"
+    LOG_DIR="$(prompt "Log directory" "$LOG_DIR")"
+    RETENTION_DAYS="$(prompt "Retention days" "$RETENTION_DAYS")"
+
+    FTP_ENABLED="$(prompt_bool "Enable FTP remote?" "n")"
+    if [ "$FTP_ENABLED" = true ]; then
+        FTP_HOST="$(prompt "FTP host" "$FTP_HOST")"
+        FTP_PORT="$(prompt "FTP port" "$FTP_PORT")"
+        FTP_USER="$(prompt "FTP user" "$FTP_USER")"
+        FTP_PASSWORD="$(prompt_secret "FTP password")"
+        FTP_REMOTE_PATH="$(prompt "FTP remote path" "$FTP_REMOTE_PATH")"
+        FTP_VERIFY_TLS="$(prompt_bool "Verify FTP TLS certs?" "y")"
+    else
+        FTP_HOST=""; FTP_PORT="21"; FTP_USER=""; FTP_PASSWORD=""; FTP_REMOTE_PATH="/backups"; FTP_VERIFY_TLS="true"
     fi
-    
-    log_success "Configuration file found"
-    
-    # Test each enabled remote
-    local remotes=($(determine_remotes))
-    for remote in "${remotes[@]}"; do
-        log_info "Testing $remote connection..."
-        case "$remote" in
+
+    S3_ENABLED="$(prompt_bool "Enable S3 remote?" "n")"
+    if [ "$S3_ENABLED" = true ]; then
+        S3_BUCKET="$(prompt "S3 bucket" "$S3_BUCKET")"
+        S3_REGION="$(prompt "S3 region" "$S3_REGION")"
+        S3_ACCESS_KEY="$(prompt "S3 access key" "$S3_ACCESS_KEY")"
+        S3_SECRET_KEY="$(prompt_secret "S3 secret key")"
+        S3_PREFIX="$(prompt "S3 prefix" "$S3_PREFIX")"
+        S3_ENDPOINT_URL="$(prompt "S3 endpoint URL (empty for AWS)" "$S3_ENDPOINT_URL")"
+        S3_VERIFY_SSL="$(prompt_bool "Verify S3 TLS certs?" "y")"
+        S3_AUTO_CREATE_BUCKET="$(prompt_bool "Auto-create bucket if missing on push?" "y")"
+    else
+        S3_BUCKET=""; S3_REGION="us-east-1"; S3_ACCESS_KEY=""; S3_SECRET_KEY=""; S3_PREFIX=""; S3_ENDPOINT_URL=""; S3_VERIFY_SSL="true"; S3_AUTO_CREATE_BUCKET="true"
+    fi
+
+    RSYNC_ENABLED="$(prompt_bool "Enable Rsync remote?" "n")"
+    if [ "$RSYNC_ENABLED" = true ]; then
+        RSYNC_MODE="$(prompt "Rsync mode (ssh|daemon)" "${RSYNC_MODE:-ssh}")"
+        RSYNC_MODE="$(echo "$RSYNC_MODE" | tr '[:upper:]' '[:lower:]')"
+        case "$RSYNC_MODE" in
+            ssh|daemon) ;;
+            *) die "Invalid rsync mode: $RSYNC_MODE (expected ssh or daemon)" ;;
+        esac
+
+        RSYNC_HOST="$(prompt "Rsync host" "$RSYNC_HOST")"
+        if [ "$RSYNC_MODE" = "daemon" ]; then
+            [ "${RSYNC_PORT:-}" = "22" ] && RSYNC_PORT="873"
+            RSYNC_PORT="$(prompt "Rsync daemon port" "${RSYNC_PORT:-873}")"
+            RSYNC_USER="$(prompt "Rsync user (optional)" "$RSYNC_USER")"
+            RSYNC_REMOTE_PATH="$(prompt "Rsync daemon module/path" "${RSYNC_REMOTE_PATH#/}")"
+            RSYNC_SSH_KEY=""
+            RSYNC_PASSWORD="$(prompt_secret "Rsync daemon password (optional)")"
+        else
+            [ "${RSYNC_PORT:-}" = "873" ] && RSYNC_PORT="22"
+            RSYNC_PORT="$(prompt "SSH port" "${RSYNC_PORT:-22}")"
+            RSYNC_USER="$(prompt "Rsync SSH user" "$RSYNC_USER")"
+            RSYNC_REMOTE_PATH="$(prompt "Rsync SSH remote path" "$RSYNC_REMOTE_PATH")"
+            RSYNC_SSH_KEY="$(prompt "Rsync SSH key path" "$RSYNC_SSH_KEY")"
+            RSYNC_PASSWORD="$(prompt_secret "Rsync SSH password (optional fallback)")"
+        fi
+    else
+        RSYNC_MODE="ssh"; RSYNC_HOST=""; RSYNC_PORT="22"; RSYNC_USER=""; RSYNC_REMOTE_PATH="/backups"; RSYNC_SSH_KEY="/root/.ssh/id_rsa"; RSYNC_PASSWORD=""
+    fi
+
+    remotes=""
+    [ "$FTP_ENABLED" = true ] && remotes="${remotes},ftp"
+    [ "$S3_ENABLED" = true ] && remotes="${remotes},s3"
+    [ "$RSYNC_ENABLED" = true ] && remotes="${remotes},rsync"
+    ENABLED_REMOTES="${remotes#,}"
+
+    ensure_dir "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<CFG
+# Beamup sync config generated on $(date '+%Y-%m-%d %H:%M:%S')
+BEAMUP_BASE="$BEAMUP_BASE"
+LOCAL_ARCHIVE_DIR="$LOCAL_ARCHIVE_DIR"
+DOWNLOAD_DIR="$DOWNLOAD_DIR"
+LOG_DIR="$LOG_DIR"
+LOCK_FILE="$LOCK_FILE"
+RETENTION_DAYS="$RETENTION_DAYS"
+ENABLED_REMOTES="$ENABLED_REMOTES"
+
+FTP_ENABLED="$FTP_ENABLED"
+FTP_HOST="$FTP_HOST"
+FTP_PORT="$FTP_PORT"
+FTP_USER="$FTP_USER"
+FTP_PASSWORD="$FTP_PASSWORD"
+FTP_REMOTE_PATH="$FTP_REMOTE_PATH"
+FTP_VERIFY_TLS="$FTP_VERIFY_TLS"
+
+S3_ENABLED="$S3_ENABLED"
+S3_BUCKET="$S3_BUCKET"
+S3_REGION="$S3_REGION"
+S3_ACCESS_KEY="$S3_ACCESS_KEY"
+S3_SECRET_KEY="$S3_SECRET_KEY"
+S3_PREFIX="$S3_PREFIX"
+S3_ENDPOINT_URL="$S3_ENDPOINT_URL"
+S3_VERIFY_SSL="$S3_VERIFY_SSL"
+S3_AUTO_CREATE_BUCKET="$S3_AUTO_CREATE_BUCKET"
+
+RSYNC_ENABLED="$RSYNC_ENABLED"
+RSYNC_MODE="$RSYNC_MODE"
+RSYNC_HOST="$RSYNC_HOST"
+RSYNC_PORT="$RSYNC_PORT"
+RSYNC_USER="$RSYNC_USER"
+RSYNC_REMOTE_PATH="$RSYNC_REMOTE_PATH"
+RSYNC_SSH_KEY="$RSYNC_SSH_KEY"
+RSYNC_PASSWORD="$RSYNC_PASSWORD"
+CFG
+    chmod 600 "$CONFIG_FILE"
+
+    log_info "Config saved: $CONFIG_FILE"
+    log_info "Enabled remotes: ${ENABLED_REMOTES:-none}"
+}
+
+cmd_verify() {
+    require_root
+    load_config
+    init_log "verify"
+    require_config_file
+
+    local failed=false
+    local mode=""
+    local port=""
+
+    command -v tar >/dev/null 2>&1 || { log_error "tar missing"; failed=true; }
+    command -v sha256sum >/dev/null 2>&1 || { log_error "sha256sum missing"; failed=true; }
+
+    local remotes
+    remotes="$(enabled_remotes_csv)"
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        case "$r" in
             ftp)
-                command -v lftp &> /dev/null && log_success "[FTP] lftp installed" || log_error "[FTP] lftp not installed"
+                command -v lftp >/dev/null 2>&1 || { log_error "lftp missing for FTP"; failed=true; }
+                [ -n "$FTP_HOST" ] || { log_error "FTP_HOST missing"; failed=true; }
                 ;;
             s3)
-                command -v aws &> /dev/null && log_success "[S3] aws-cli installed" || log_error "[S3] aws-cli not installed"
+                command -v aws >/dev/null 2>&1 || { log_error "aws CLI missing for S3"; failed=true; }
+                [ -n "$S3_BUCKET" ] || { log_error "S3_BUCKET missing"; failed=true; }
+                [ -n "$S3_ACCESS_KEY" ] || { log_error "S3_ACCESS_KEY missing"; failed=true; }
+                [ -n "$S3_SECRET_KEY" ] || { log_error "S3_SECRET_KEY missing"; failed=true; }
                 ;;
             rsync)
-                command -v rsync &> /dev/null && log_success "[RSYNC] rsync installed" || log_error "[RSYNC] rsync not installed"
+                command -v rsync >/dev/null 2>&1 || { log_error "rsync missing"; failed=true; }
+                [ -n "$RSYNC_HOST" ] || { log_error "RSYNC_HOST missing"; failed=true; }
+                port="$(rsync_effective_port)"
+                [[ "$port" =~ ^[0-9]+$ ]] || { log_error "RSYNC_PORT must be numeric"; failed=true; }
+
+                mode="$(rsync_mode)"
+                if [ "$mode" = "daemon" ]; then
+                    [ -n "$RSYNC_REMOTE_PATH" ] || { log_error "RSYNC_REMOTE_PATH missing for daemon mode"; failed=true; }
+                else
+                    [ -n "$RSYNC_USER" ] || { log_error "RSYNC_USER missing for ssh mode"; failed=true; }
+                    if [ -n "$RSYNC_PASSWORD" ] && ! command -v sshpass >/dev/null 2>&1; then
+                        log_error "sshpass missing but RSYNC_PASSWORD is set for ssh mode"
+                        failed=true
+                    fi
+                    if [ -z "$RSYNC_PASSWORD" ] && { [ -z "$RSYNC_SSH_KEY" ] || [ ! -f "$RSYNC_SSH_KEY" ]; }; then
+                        log_error "Rsync ssh mode has no valid auth: set RSYNC_PASSWORD or a valid RSYNC_SSH_KEY"
+                        failed=true
+                    fi
+                fi
+                ;;
+            *)
+                log_error "Unknown remote in config: $r"
+                failed=true
                 ;;
         esac
+    done < <(split_csv "$remotes")
+
+    if [ "$failed" = true ]; then
+        die "Verification failed"
+    fi
+
+    log_info "Verification passed"
+}
+
+cmd_backup() {
+    require_root
+    run_backup_script
+}
+
+cmd_push() {
+    require_root
+    load_config
+    init_log "sync"
+    require_config_file
+
+    if [ "$FORCE" = true ]; then
+        log_info "Creating fresh backup before push"
+        run_backup_script
+    fi
+
+    build_selected_remotes
+
+    local -a archives=()
+    if [ "$PUSH_ALL" = true ]; then
+        while IFS= read -r a; do
+            [ -n "$a" ] && archives+=("$a")
+        done < <(list_local_archives)
+    else
+        latest="$(latest_local_archive)"
+        [ -n "$latest" ] && archives+=("$latest")
+    fi
+
+    [ ${#archives[@]} -gt 0 ] || die "No local archives to push"
+
+    acquire_lock
+    trap release_lock EXIT
+
+    local success=0
+    local failed=0
+    for archive in "${archives[@]}"; do
+        checksum="$(checksum_path "$archive")"
+        [ -f "$checksum" ] || die "Missing checksum for $archive"
+
+        log_info "Pushing $(basename "$archive")"
+        local pushed_any=false
+        for remote in "${SELECTED_REMOTES[@]}"; do
+            if remote_push "$remote" "$archive" "$checksum"; then
+                log_info "  [$remote] ok"
+                pushed_any=true
+            else
+                log_warn "  [$remote] failed"
+            fi
+        done
+
+        if [ "$pushed_any" = true ]; then
+            success=$((success + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    log_info "Push summary: success=$success failed=$failed"
+    [ "$success" -gt 0 ] || exit 1
+}
+
+cmd_list() {
+    require_root
+    load_config
+    init_log "sync"
+    require_config_file
+
+    build_selected_remotes
+
+    for remote in "${SELECTED_REMOTES[@]}"; do
+        echo ""
+        echo "=== $remote ==="
+        if ! remote_list "$remote"; then
+            log_warn "List failed on remote: $remote"
+        fi
     done
 }
 
-# Main command router
-case "$COMMAND" in
-    push)
-        cmd_push
-        ;;
-    pull)
-        cmd_pull
-        ;;
-    backup)
-        cmd_backup
-        ;;
-    restore)
-        cmd_restore
-        ;;
-    list)
-        cmd_list
-        ;;
-    config)
-        cmd_config
-        ;;
-    verify)
-        cmd_verify
-        ;;
-    *)
-        show_usage
-        exit 1
-        ;;
-esac
+cmd_pull() {
+    require_root
+    load_config
+    init_log "sync"
+    require_config_file
+
+    build_selected_remotes
+
+    wanted="$ARG_VALUE"
+    [ "$USE_LATEST" = true ] && wanted="latest"
+    [ -n "$wanted" ] || die "Provide archive name or --latest"
+
+    ensure_dir "$DOWNLOAD_DIR"
+
+    acquire_lock
+    trap release_lock EXIT
+
+    pull_dir="${DOWNLOAD_DIR}/pull-$(date +%Y%m%d_%H%M%S)"
+    ensure_dir "$pull_dir"
+
+    resolved=""
+    for remote in "${SELECTED_REMOTES[@]}"; do
+        log_info "Trying remote: $remote"
+        if resolved="$(remote_pull "$remote" "$wanted" "$pull_dir")"; then
+            [ -n "$resolved" ] || resolved="$wanted"
+            break
+        fi
+    done
+
+    [ -n "$resolved" ] || die "Pull failed on all selected remotes"
+
+    archive_path="${pull_dir}/${resolved}"
+    verify_archive_checksum "$archive_path" || die "Downloaded archive checksum verification failed"
+
+    log_info "Downloaded: $archive_path"
+
+    if [ "$AUTO_RESTORE" = true ]; then
+        FORCE=true
+        run_restore_script "$archive_path"
+    fi
+}
+
+cmd_restore() {
+    require_root
+    run_restore_script "$ARG_VALUE"
+}
+
+main() {
+    require_command
+    parse_flags "$@"
+
+    case "$COMMAND" in
+        config) cmd_config ;;
+        verify) cmd_verify ;;
+        backup) cmd_backup ;;
+        push) cmd_push ;;
+        pull) cmd_pull ;;
+        list) cmd_list ;;
+        restore) cmd_restore ;;
+    esac
+}
+
+main "$@"
