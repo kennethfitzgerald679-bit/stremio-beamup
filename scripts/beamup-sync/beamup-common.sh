@@ -10,6 +10,9 @@ LOG_DIR_DEFAULT="/var/log/beamup-sync"
 CONFIG_FILE_DEFAULT="/etc/beamup/sync.conf"
 LOCK_FILE_DEFAULT="/var/lock/beamup-sync.lock"
 RETENTION_DAYS_DEFAULT="30"
+BACKUP_ENCRYPTION_ENABLED_DEFAULT="false"
+BACKUP_ENCRYPT_SSH_KEY_DEFAULT="/etc/beamup/keys/sync"
+RSYNC_SSH_KEY_DEFAULT="/etc/beamup/keys/sync"
 
 VERBOSE=false
 LOG_FILE=""
@@ -87,6 +90,8 @@ load_config() {
     CONFIG_FILE="${CONFIG_FILE:-$CONFIG_FILE_DEFAULT}"
     LOCK_FILE="${LOCK_FILE:-$LOCK_FILE_DEFAULT}"
     RETENTION_DAYS="${RETENTION_DAYS:-$RETENTION_DAYS_DEFAULT}"
+    BACKUP_ENCRYPTION_ENABLED="${BACKUP_ENCRYPTION_ENABLED:-$BACKUP_ENCRYPTION_ENABLED_DEFAULT}"
+    BACKUP_ENCRYPT_SSH_KEY="${BACKUP_ENCRYPT_SSH_KEY:-$BACKUP_ENCRYPT_SSH_KEY_DEFAULT}"
 
     ENABLED_REMOTES="${ENABLED_REMOTES:-}"
 
@@ -114,7 +119,7 @@ load_config() {
     RSYNC_PORT="${RSYNC_PORT:-22}"
     RSYNC_USER="${RSYNC_USER:-}"
     RSYNC_REMOTE_PATH="${RSYNC_REMOTE_PATH:-/backups}"
-    RSYNC_SSH_KEY="${RSYNC_SSH_KEY:-/root/.ssh/id_rsa}"
+    RSYNC_SSH_KEY="${RSYNC_SSH_KEY:-$RSYNC_SSH_KEY_DEFAULT}"
     RSYNC_PASSWORD="${RSYNC_PASSWORD:-}"
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -130,6 +135,8 @@ load_config() {
     CONFIG_FILE="${CONFIG_FILE:-$CONFIG_FILE_DEFAULT}"
     LOCK_FILE="${LOCK_FILE:-$LOCK_FILE_DEFAULT}"
     RETENTION_DAYS="${RETENTION_DAYS:-$RETENTION_DAYS_DEFAULT}"
+    BACKUP_ENCRYPTION_ENABLED="${BACKUP_ENCRYPTION_ENABLED:-$BACKUP_ENCRYPTION_ENABLED_DEFAULT}"
+    BACKUP_ENCRYPT_SSH_KEY="${BACKUP_ENCRYPT_SSH_KEY:-$BACKUP_ENCRYPT_SSH_KEY_DEFAULT}"
     RSYNC_MODE="${RSYNC_MODE:-ssh}"
     RSYNC_PORT="${RSYNC_PORT:-22}"
     S3_AUTO_CREATE_BUCKET="${S3_AUTO_CREATE_BUCKET:-true}"
@@ -175,12 +182,14 @@ release_lock() {
 
 latest_local_archive() {
     [ -d "$LOCAL_ARCHIVE_DIR" ] || return 0
-    find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f -name 'beamup-backup-*.tar.xz' | sort -r | head -n 1
+    find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f \
+        \( -name 'beamup-backup-*.tar.xz' -o -name 'beamup-backup-*.tar.xz.age' \) | sort -r | head -n 1
 }
 
 list_local_archives() {
     [ -d "$LOCAL_ARCHIVE_DIR" ] || return 0
-    find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f -name 'beamup-backup-*.tar.xz' | sort -r
+    find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f \
+        \( -name 'beamup-backup-*.tar.xz' -o -name 'beamup-backup-*.tar.xz.age' \) | sort -r
 }
 
 checksum_path() {
@@ -210,7 +219,9 @@ prune_old_archives() {
         [ -n "$old" ] || continue
         rm -f "$old" "$(checksum_path "$old")"
         log_info "Pruned old archive: $(basename "$old")"
-    done < <(find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f -name 'beamup-backup-*.tar.xz' -mtime +"$((RETENTION_DAYS - 1))" | sort)
+    done < <(find "$LOCAL_ARCHIVE_DIR" -maxdepth 1 -type f \
+        \( -name 'beamup-backup-*.tar.xz' -o -name 'beamup-backup-*.tar.xz.age' \) \
+        -mtime +"$((RETENTION_DAYS - 1))" | sort)
 }
 
 confirm_exact_yes() {
@@ -231,4 +242,43 @@ enabled_remotes_csv() {
     [ "$(as_bool "$S3_ENABLED")" = true ] && out="${out},s3"
     [ "$(as_bool "$RSYNC_ENABLED")" = true ] && out="${out},rsync"
     echo "${out#,}"
+}
+
+is_encrypted_archive() {
+    case "$1" in
+        *.tar.xz.age) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_encryption_enabled() {
+    [ "$(as_bool "$BACKUP_ENCRYPTION_ENABLED")" = true ]
+}
+
+require_backup_encryption_prereqs() {
+    backup_encryption_enabled || return 0
+    require_backup_encryption_key
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required when BACKUP_ENCRYPTION_ENABLED=true"
+}
+
+require_backup_encryption_key() {
+    command -v age >/dev/null 2>&1 || die "age is required for encrypted backups"
+    [ -n "$BACKUP_ENCRYPT_SSH_KEY" ] || die "BACKUP_ENCRYPT_SSH_KEY is empty"
+    [ -f "$BACKUP_ENCRYPT_SSH_KEY" ] || die "BACKUP_ENCRYPT_SSH_KEY not found: $BACKUP_ENCRYPT_SSH_KEY"
+}
+
+backup_encrypt_recipient_from_key() {
+    local key_path="${1:-$BACKUP_ENCRYPT_SSH_KEY}"
+    local recipient=""
+
+    recipient="$(ssh-keygen -y -f "$key_path" </dev/null 2>> "$LOG_FILE" || true)"
+    recipient="$(trim "$recipient")"
+    [ -n "$recipient" ] || die "Failed to derive SSH public key from BACKUP_ENCRYPT_SSH_KEY: $key_path"
+
+    case "$recipient" in
+        ssh-*) ;;
+        *) die "Derived key is not a valid SSH public key from: $key_path" ;;
+    esac
+
+    echo "$recipient"
 }

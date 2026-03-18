@@ -83,11 +83,23 @@ cleanup_tmp() {
 }
 trap 'cleanup_tmp; release_lock' EXIT
 
+extract_archive="$ARCHIVE_PATH"
+if is_encrypted_archive "$ARCHIVE_PATH"; then
+    require_backup_encryption_key
+    extract_archive="${tmp_dir}/archive.tar.xz"
+    log_info "Decrypting archive with SSH key: $BACKUP_ENCRYPT_SSH_KEY"
+    if [ "$VERBOSE" = true ]; then
+        age -d -i "$BACKUP_ENCRYPT_SSH_KEY" -o "$extract_archive" "$ARCHIVE_PATH" 2>&1 | tee -a "$LOG_FILE"
+    else
+        age -d -i "$BACKUP_ENCRYPT_SSH_KEY" -o "$extract_archive" "$ARCHIVE_PATH" >> "$LOG_FILE" 2>&1
+    fi
+fi
+
 log_info "Extracting archive"
 if [ "$VERBOSE" = true ]; then
-    tar -xJvf "$ARCHIVE_PATH" -C "$tmp_dir" 2>&1 | tee -a "$LOG_FILE"
+    tar -xJvf "$extract_archive" -C "$tmp_dir" 2>&1 | tee -a "$LOG_FILE"
 else
-    tar -xJf "$ARCHIVE_PATH" -C "$tmp_dir" >> "$LOG_FILE" 2>&1
+    tar -xJf "$extract_archive" -C "$tmp_dir" >> "$LOG_FILE" 2>&1
 fi
 
 # Validate that mandatory restore content exists in the archive.

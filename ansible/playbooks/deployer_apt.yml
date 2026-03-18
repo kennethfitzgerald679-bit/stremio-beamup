@@ -89,6 +89,13 @@
         update_cache: yes
         cache_valid_time: 3600
 
+    - name: Install age package for beamup-sync encryption
+      apt:
+        name: age
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
     - name: Download AWS CLI v2 bundle
       get_url:
         url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip

@@ -127,6 +127,30 @@ parse_flags() {
     done
 }
 
+normalize_archive_name() {
+    local name="${1:-}"
+    name="${name%$'\r'}"
+    name="${name##*/}"
+    echo "$name"
+}
+
+is_archive_name() {
+    case "$1" in
+        *.tar.xz|*.tar.xz.age) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+list_archive_names_from_stdin() {
+    local raw name
+    while IFS= read -r raw; do
+        name="$(normalize_archive_name "$raw")"
+        if is_archive_name "$name"; then
+            echo "$name"
+        fi
+    done | sort -u
+}
+
 build_selected_remotes() {
     SELECTED_REMOTES=()
 
@@ -198,7 +222,8 @@ ftp_list() {
     local ssl
     ssl="$(ftp_ssl_cfg)"
 
-    lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} cd ${FTP_REMOTE_PATH}; cls -1 *.tar.xz; bye" 2>> "$LOG_FILE" | sort
+    lftp -u "${FTP_USER},${FTP_PASSWORD}" "$host" -e "${ssl} cd ${FTP_REMOTE_PATH}; cls -1; bye" 2>> "$LOG_FILE" \
+        | list_archive_names_from_stdin
 }
 
 ftp_pull() {
@@ -213,6 +238,8 @@ ftp_pull() {
         picked="$(ftp_list | tail -n 1)"
         [ -n "$picked" ] || return 1
     fi
+    picked="$(normalize_archive_name "$picked")"
+    is_archive_name "$picked" || return 1
 
     ensure_dir "$dest"
 
@@ -312,7 +339,7 @@ s3_list() {
     [ "$(as_bool "$S3_ENABLED")" = true ] || return 1
     command -v aws >/dev/null 2>&1 || die "aws CLI not installed"
 
-    s3_cmd ls "s3://${S3_BUCKET}/$(s3_key "")" 2>> "$LOG_FILE" | awk '$4 ~ /\.tar\.xz$/ {print $4}' | sort
+    s3_cmd ls "s3://${S3_BUCKET}/$(s3_key "")" 2>> "$LOG_FILE" | awk '{print $4}' | list_archive_names_from_stdin
 }
 
 s3_pull() {
@@ -327,6 +354,8 @@ s3_pull() {
         picked="$(s3_list | tail -n 1)"
         [ -n "$picked" ] || return 1
     fi
+    picked="$(normalize_archive_name "$picked")"
+    is_archive_name "$picked" || return 1
 
     ensure_dir "$dest"
 
@@ -398,7 +427,7 @@ rsync_daemon_list() {
         output="$(rsync --list-only "${base}/" 2>> "$LOG_FILE")" || return 1
     fi
 
-    echo "$output" | awk '$NF ~ /\.tar\.xz$/ {name=$NF; sub(/\/$/, "", name); print name}' | sort
+    echo "$output" | awk '{print $NF}' | sed 's#/$##' | list_archive_names_from_stdin
 }
 
 rsync_daemon_pull() {
@@ -411,6 +440,8 @@ rsync_daemon_pull() {
         picked="$(rsync_daemon_list | tail -n 1)"
         [ -n "$picked" ] || return 1
     fi
+    picked="$(normalize_archive_name "$picked")"
+    is_archive_name "$picked" || return 1
 
     ensure_dir "$dest"
 
@@ -503,7 +534,8 @@ rsync_list() {
     else
         local quoted
         quoted="$(quote_shell "$RSYNC_REMOTE_PATH")"
-        rsync_ssh "find ${quoted} -maxdepth 1 -type f -name '*.tar.xz' -exec basename {} \\;" | sort
+        rsync_ssh "find ${quoted} -maxdepth 1 -type f \\( -name '*.tar.xz' -o -name '*.tar.xz.age' \\) -exec basename {} \\;" \
+            | list_archive_names_from_stdin
     fi
 }
 
@@ -519,6 +551,8 @@ rsync_pull() {
         picked="$(rsync_list | tail -n 1)"
         [ -n "$picked" ] || return 1
     fi
+    picked="$(normalize_archive_name "$picked")"
+    is_archive_name "$picked" || return 1
 
     ensure_dir "$dest"
 
@@ -608,6 +642,10 @@ cmd_config() {
     DOWNLOAD_DIR="$(prompt "Download directory" "$DOWNLOAD_DIR")"
     LOG_DIR="$(prompt "Log directory" "$LOG_DIR")"
     RETENTION_DAYS="$(prompt "Retention days" "$RETENTION_DAYS")"
+    BACKUP_ENCRYPTION_ENABLED="$(prompt_bool "Encrypt backups with SSH key?" "$BACKUP_ENCRYPTION_ENABLED")"
+    if [ "$BACKUP_ENCRYPTION_ENABLED" = true ]; then
+        BACKUP_ENCRYPT_SSH_KEY="$(prompt "Backup encryption SSH private key path" "$BACKUP_ENCRYPT_SSH_KEY")"
+    fi
 
     FTP_ENABLED="$(prompt_bool "Enable FTP remote?" "n")"
     if [ "$FTP_ENABLED" = true ]; then
@@ -661,7 +699,7 @@ cmd_config() {
             RSYNC_PASSWORD="$(prompt_secret "Rsync SSH password (optional fallback)")"
         fi
     else
-        RSYNC_MODE="ssh"; RSYNC_HOST=""; RSYNC_PORT="22"; RSYNC_USER=""; RSYNC_REMOTE_PATH="/backups"; RSYNC_SSH_KEY="/root/.ssh/id_rsa"; RSYNC_PASSWORD=""
+        RSYNC_MODE="ssh"; RSYNC_HOST=""; RSYNC_PORT="22"; RSYNC_USER=""; RSYNC_REMOTE_PATH="/backups"; RSYNC_SSH_KEY="$RSYNC_SSH_KEY_DEFAULT"; RSYNC_PASSWORD=""
     fi
 
     remotes=""
@@ -679,6 +717,8 @@ DOWNLOAD_DIR="$DOWNLOAD_DIR"
 LOG_DIR="$LOG_DIR"
 LOCK_FILE="$LOCK_FILE"
 RETENTION_DAYS="$RETENTION_DAYS"
+BACKUP_ENCRYPTION_ENABLED="$BACKUP_ENCRYPTION_ENABLED"
+BACKUP_ENCRYPT_SSH_KEY="$BACKUP_ENCRYPT_SSH_KEY"
 ENABLED_REMOTES="$ENABLED_REMOTES"
 
 FTP_ENABLED="$FTP_ENABLED"
@@ -726,6 +766,16 @@ cmd_verify() {
 
     command -v tar >/dev/null 2>&1 || { log_error "tar missing"; failed=true; }
     command -v sha256sum >/dev/null 2>&1 || { log_error "sha256sum missing"; failed=true; }
+    if [ "$(as_bool "$BACKUP_ENCRYPTION_ENABLED")" = true ]; then
+        command -v age >/dev/null 2>&1 || { log_error "age missing but BACKUP_ENCRYPTION_ENABLED=true"; failed=true; }
+        command -v ssh-keygen >/dev/null 2>&1 || { log_error "ssh-keygen missing but BACKUP_ENCRYPTION_ENABLED=true"; failed=true; }
+        [ -n "$BACKUP_ENCRYPT_SSH_KEY" ] || { log_error "BACKUP_ENCRYPT_SSH_KEY missing"; failed=true; }
+        [ -f "$BACKUP_ENCRYPT_SSH_KEY" ] || { log_error "BACKUP_ENCRYPT_SSH_KEY not found: $BACKUP_ENCRYPT_SSH_KEY"; failed=true; }
+        if [ -f "$BACKUP_ENCRYPT_SSH_KEY" ] && ! ssh-keygen -y -f "$BACKUP_ENCRYPT_SSH_KEY" </dev/null >/dev/null 2>> "$LOG_FILE"; then
+            log_error "BACKUP_ENCRYPT_SSH_KEY must be a readable SSH private key (without interactive passphrase prompt)"
+            failed=true
+        fi
+    fi
 
     local remotes
     remotes="$(enabled_remotes_csv)"
@@ -879,6 +929,7 @@ cmd_pull() {
     for remote in "${SELECTED_REMOTES[@]}"; do
         log_info "Trying remote: $remote"
         if resolved="$(remote_pull "$remote" "$wanted" "$pull_dir")"; then
+            resolved="$(normalize_archive_name "$resolved")"
             [ -n "$resolved" ] || resolved="$wanted"
             break
         fi

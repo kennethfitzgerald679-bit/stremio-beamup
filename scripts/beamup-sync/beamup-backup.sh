@@ -22,7 +22,7 @@ Usage: beamup-backup [OPTIONS]
 
 Options:
   -v, --verbose         Verbose output
-  -n, --name NAME       Archive name (without .tar.xz)
+  -n, --name NAME       Archive name (without extension)
   -h, --help            Show help
 USAGE
 }
@@ -60,8 +60,14 @@ ensure_dir "$LOCAL_ARCHIVE_DIR"
 if [ -z "$ARCHIVE_NAME" ]; then
     ARCHIVE_NAME="beamup-backup-$(date +%Y%m%d_%H%M%S)"
 fi
+ARCHIVE_NAME="${ARCHIVE_NAME%.tar.xz.age}"
 ARCHIVE_NAME="${ARCHIVE_NAME%.tar.xz}"
-ARCHIVE_PATH="${LOCAL_ARCHIVE_DIR}/${ARCHIVE_NAME}.tar.xz"
+ARCHIVE_PLAIN_PATH="${LOCAL_ARCHIVE_DIR}/${ARCHIVE_NAME}.tar.xz"
+ARCHIVE_PATH="$ARCHIVE_PLAIN_PATH"
+if backup_encryption_enabled; then
+    require_backup_encryption_prereqs
+    ARCHIVE_PATH="${ARCHIVE_PLAIN_PATH}.age"
+fi
 CHECKSUM_PATH="$(checksum_path "$ARCHIVE_PATH")"
 
 # Mandatory backup set:
@@ -110,7 +116,7 @@ for key in "${ssh_host_keys[@]}"; do
     fi
 done
 
-log_info "Creating archive: $(basename "$ARCHIVE_PATH")"
+log_info "Creating archive: $(basename "$ARCHIVE_PLAIN_PATH")"
 tar_excludes=(
     "--exclude=home/dokku/*/cache"
     "--exclude=home/dokku/*/cache/*"
@@ -119,9 +125,27 @@ if [ "$VERBOSE" = true ]; then
     for i in "${selected[@]}"; do
         log_debug "include: /$i"
     done
-    tar -C / -cJvf "$ARCHIVE_PATH" "${tar_excludes[@]}" "${selected[@]}" 2>&1 | tee -a "$LOG_FILE"
+    tar -C / -cJvf "$ARCHIVE_PLAIN_PATH" "${tar_excludes[@]}" "${selected[@]}" 2>&1 | tee -a "$LOG_FILE"
 else
-    tar -C / -cJf "$ARCHIVE_PATH" "${tar_excludes[@]}" "${selected[@]}" >> "$LOG_FILE" 2>&1
+    tar -C / -cJf "$ARCHIVE_PLAIN_PATH" "${tar_excludes[@]}" "${selected[@]}" >> "$LOG_FILE" 2>&1
+fi
+
+if backup_encryption_enabled; then
+    recipient="$(backup_encrypt_recipient_from_key "$BACKUP_ENCRYPT_SSH_KEY")"
+    log_info "Encrypting archive with SSH key: $BACKUP_ENCRYPT_SSH_KEY"
+    encrypt_cmd=(age -r "$recipient" -o "$ARCHIVE_PATH" "$ARCHIVE_PLAIN_PATH")
+    if [ "$VERBOSE" = true ]; then
+        if ! "${encrypt_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            rm -f "$ARCHIVE_PATH" "$ARCHIVE_PLAIN_PATH"
+            die "Failed to encrypt archive"
+        fi
+    else
+        if ! "${encrypt_cmd[@]}" >> "$LOG_FILE" 2>&1; then
+            rm -f "$ARCHIVE_PATH" "$ARCHIVE_PLAIN_PATH"
+            die "Failed to encrypt archive"
+        fi
+    fi
+    rm -f "$ARCHIVE_PLAIN_PATH"
 fi
 
 (

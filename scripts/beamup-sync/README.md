@@ -41,6 +41,8 @@ DOWNLOAD_DIR="/var/backups/beamup/downloads"
 LOG_DIR="/var/log/beamup-sync"
 LOCK_FILE="/var/lock/beamup-sync.lock"
 RETENTION_DAYS="30"
+BACKUP_ENCRYPTION_ENABLED="false"
+BACKUP_ENCRYPT_SSH_KEY="/etc/beamup/keys/sync"
 ENABLED_REMOTES="s3,rsync"
 
 FTP_ENABLED="false"
@@ -82,9 +84,17 @@ RSYNC_PASSWORD=""
 - For SSH mode, auth order is SSH key first, then password fallback (`sshpass`) if configured.
 - For daemon mode, `RSYNC_PASSWORD` is passed via rsync's standard `RSYNC_PASSWORD` env var.
 - S3 push auto-creates the bucket when missing if `S3_AUTO_CREATE_BUCKET="true"`.
-- Backups are saved as `beamup-backup-<timestamp>.tar.xz` with `.sha256` checksum.
+- If `BACKUP_ENCRYPTION_ENABLED="true"`, backups are encrypted with `age` using the SSH private key in
+  `BACKUP_ENCRYPT_SSH_KEY` and saved as `beamup-backup-<timestamp>.tar.xz.age`.
+- If encryption is disabled, backups are saved as `beamup-backup-<timestamp>.tar.xz`.
+- Every archive (encrypted or plain) has a matching `.sha256` checksum file.
 - Backup content is mandatory and always includes:
   - `/home/dokku/.ssh/authorized_keys`
   - `/home/dokku` (Dokku app directories)
   - `/etc/ssh/ssh_host_*`
   - `/etc/cron.daily` (and `/etc/crontab` if present)
+- Backups exclude Dokku app cache directories (`/home/dokku/*/cache/*`).
+- Restore flow creates missing Dokku apps first, restores `/home/dokku` without `.ssh`,
+  restores `/etc/ssh/ssh_host_*` and restarts SSH, then applies ownership/perms.
+- Restoring an encrypted archive (`*.tar.xz.age`) automatically decrypts it using
+  `BACKUP_ENCRYPT_SSH_KEY`.
