@@ -17,6 +17,9 @@ SCRIPT_PATH="$(readlink -f "$0")"
 BOOT_SERVICE_NAME="beamup-local-dns-init.service"
 BOOT_SERVICE_PATH="/etc/systemd/system/${BOOT_SERVICE_NAME}"
 
+if [ -z "${LOCAL_BEAMUP_DOMAIN:-}" ] && [ -t 0 ]; then
+  read -r -p "Local Beamup domain [beamup.test]: " LOCAL_BEAMUP_DOMAIN
+fi
 LOCAL_BEAMUP_DOMAIN="${LOCAL_BEAMUP_DOMAIN:-beamup.test}"
 DNS_UPSTREAM="${DNS_UPSTREAM:-1.1.1.1}"
 HOST_LAN_IFACE="${HOST_LAN_IFACE:-$(ip route show default | awk 'NR==1 {print $5}')}"
@@ -105,6 +108,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment=LOCAL_BEAMUP_DOMAIN=${LOCAL_BEAMUP_DOMAIN}
 ExecStart=/usr/bin/env bash ${SCRIPT_PATH} --no-service-install
 Restart=on-failure
 RestartSec=15
