@@ -93,3 +93,32 @@ After the local infrastructure is deployed, use this flow to deploy addons with 
 3. Run `beamup deploy`.
 
 Once these are done, addon deployment should work end-to-end in the local setup.
+
+### Removing VMs
+  When installaction was successfull a simple `terraform destroy -var-file=dev.tfvars" should suffice.
+
+  When the deployment had issues and the VMs are in a inconsistent state, these commands may be usefull to clean everything:
+  To list and get the list of names:
+  ```bash
+     destroy                        destroy (stop) a domain
+  virsh list --all
+  ```
+
+  To shut down or stop forcefully (destroy command):
+  ```bash
+  virsh shutdown --domain stremio-addon-deployer
+  virsh shutdown --domain stremio-beamup-swarm-0
+  virsh destroy --domain stremio-addon-deployer
+  virsh destroy --domain stremio-beamup-swarm-0
+  ```
+
+  Remove VMs and storages:
+  ```bash
+  virsh undefine --remove-all-storage --domain stremio-beamup-swarm-0
+  virsh undefine --remove-all-storage --domain stremio-beamup-swarm-0
+  ```
+
+  Check again there is nothing here:
+  ```bash
+  virsh list --all
+  ```
