@@ -4,8 +4,6 @@ set -euo pipefail
 
 sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
 
-
-
 echo 'Adding repositories ...'
 
 # Install HashiCorp's GPG key.
@@ -13,21 +11,6 @@ echo 'Adding repositories ...'
 wget -O- https://apt.releases.hashicorp.com/gpg | \
 gpg --dearmor | \
 sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
-
-# Verify the GPG key's fingerprint.
-
-gpg --no-default-keyring \
---keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg \
---fingerprint
-
-# The gpg command reports the key fingerprint:
-
-# /usr/share/keyrings/hashicorp-archive-keyring.gpg
-# -------------------------------------------------
-# pub   rsa4096 XXXX-XX-XX [SC]
-# AAAA AAAA AAAA AAAA
-# uid         [ unknown] HashiCorp Security (HashiCorp Package Signing) <security+packaging@hashicorp.com>
-# sub   rsa4096 XXXX-XX-XX [E]
 
 # Add the official HashiCorp repository to your system.
 
@@ -64,10 +47,7 @@ sudo sed -i '/^security_driver/d' /etc/libvirt/qemu.conf
 echo 'security_driver = "none"' | sudo tee -a /etc/libvirt/qemu.conf
 sudo systemctl restart libvirtd
 
-# install ansible dependencies
-
-ansible-galaxy install -r ansible/requirements.yml --force
-ansible-galaxy collection install -r ansible/requirements.yml --force
-
 echo "Local setup complete."
 echo "After terraform apply, run ./local-deployment/dns-init.sh"
+echo ""
+echo "Please log out and back in (or reboot) so the new 'libvirt' group membership takes effect before running terraform."
