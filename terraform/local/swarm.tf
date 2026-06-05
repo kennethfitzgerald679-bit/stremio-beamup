@@ -72,7 +72,7 @@ resource "ansible_host" "swarm_host" {
 }
 
 resource "null_resource" "swarm_apt_update" {
-  depends_on = [ansible_host.swarm_host]
+  depends_on = [ansible_host.swarm_host, null_resource.deployer_apt_update]
 
   provisioner "local-exec" {
     command = "ansible-playbook -T 30 -u root --ssh-extra-args='-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no' --inventory=${var.terraform_inventory_path} --limit swarm ${var.project_dir}/ansible/playbooks/apt_update.yml"
