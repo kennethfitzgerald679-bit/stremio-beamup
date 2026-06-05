@@ -64,6 +64,11 @@ resource "null_resource" "deployer_apt_update" {
 
   provisioner "local-exec" {
     command = "ansible-galaxy install -f -r ${var.project_dir}/ansible/requirements.yml"
+    # Disable .netrc parsing so ansible-galaxy doesn't send a stale github.com
+    # credential when downloading roles (a machine github.com entry causes HTTP 401).
+    environment = {
+      NETRC = ""
+    }
   }
 
   provisioner "local-exec" {
